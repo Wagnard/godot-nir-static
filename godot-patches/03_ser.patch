@@ -1,0 +1,1123 @@
+diff --git a/godot-mesa/src/compiler/nir/nir.c b/godot-mesa/src/compiler/nir/nir.c
+index 6e1b710..ec8de22 100644
+--- a/godot-mesa/src/compiler/nir/nir.c
++++ b/godot-mesa/src/compiler/nir/nir.c
+@@ -2908,8 +2908,11 @@ nir_get_shader_call_payload_src(nir_intrinsic_instr *call)
+    case nir_intrinsic_trace_ray:
+    case nir_intrinsic_rt_trace_ray:
+       return &call->src[10];
++   case nir_intrinsic_hit_object_trace_ray:
++      return &call->src[11];
+    case nir_intrinsic_execute_callable:
+    case nir_intrinsic_rt_execute_callable:
++   case nir_intrinsic_hit_object_execute_shader:
+       return &call->src[1];
+    default:
+       UNREACHABLE("Not a call intrinsic");
+diff --git a/godot-mesa/src/compiler/nir/nir.h b/godot-mesa/src/compiler/nir/nir.h
+index 6ca4b58..41e93e4 100644
+--- a/godot-mesa/src/compiler/nir/nir.h
++++ b/godot-mesa/src/compiler/nir/nir.h
+@@ -467,6 +467,11 @@ typedef struct nir_variable {
+        */
+       unsigned ray_query : 1;
+ 
++      /**
++       * Is the variable a hit object (SPV_EXT_shader_invocation_reorder)?
++       */
++      unsigned hit_object : 1;
++
+       /**
+        * Precision qualifier.
+        *
+@@ -2017,7 +2022,7 @@ typedef struct nir_io_xfb {
+ unsigned
+ nir_instr_xfb_write_mask(nir_intrinsic_instr *instr);
+ 
+-#define NIR_INTRINSIC_MAX_INPUTS 11
++#define NIR_INTRINSIC_MAX_INPUTS 12
+ 
+ typedef struct nir_intrinsic_info {
+    const char *name;
+diff --git a/godot-mesa/src/compiler/nir/nir_intrinsics.py b/godot-mesa/src/compiler/nir/nir_intrinsics.py
+index 03c9e00..8da4ca2 100644
+--- a/godot-mesa/src/compiler/nir/nir_intrinsics.py
++++ b/godot-mesa/src/compiler/nir/nir_intrinsics.py
+@@ -686,6 +686,36 @@ intrinsic("terminate_ray")
+ # src[] = { sbt_index, payload }
+ intrinsic("execute_callable", src_comp=[1, -1])
+ 
++# SPV_EXT_shader_invocation_reorder. A hit object is a function variable flagged
++# hit_object; src[0] of every intrinsic below is a deref of it.
++#
++# Same sources as trace_ray, after the hit object.
++intrinsic("hit_object_trace_ray", src_comp=[-1, -1, 1, 1, 1, 1, 1, 3, 1, 3, 1, -1])
++# src[] = { hit_object }
++intrinsic("hit_object_record_empty", src_comp=[-1])
++# src[] = { hit_object, payload }
++intrinsic("hit_object_execute_shader", src_comp=[-1, -1])
++# src[] = { hit_object, hint, number of hint bits }
++intrinsic("hit_object_reorder_thread", src_comp=[-1, 1, 1])
++# src[] = { hint, number of hint bits }
++intrinsic("reorder_thread_with_hint", src_comp=[1, 1])
++intrinsic("hit_object_is_hit", src_comp=[-1], dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_is_miss", src_comp=[-1], dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_is_empty", src_comp=[-1], dest_comp=1, bit_sizes=[1], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_instance_id", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_instance_custom_index", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_primitive_index", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_geometry_index", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_hit_kind", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_sbt_record_index", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_ray_flags", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_ray_tmin", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_ray_tmax", src_comp=[-1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_world_ray_origin", src_comp=[-1], dest_comp=3, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_world_ray_direction", src_comp=[-1], dest_comp=3, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_object_ray_origin", src_comp=[-1], dest_comp=3, bit_sizes=[32], flags=[CAN_ELIMINATE])
++intrinsic("hit_object_get_object_ray_direction", src_comp=[-1], dest_comp=3, bit_sizes=[32], flags=[CAN_ELIMINATE])
++
+ # Initialize a ray query
+ #
+ #   0. Ray Query
+diff --git a/godot-mesa/src/compiler/nir/nir_opt_access.c b/godot-mesa/src/compiler/nir/nir_opt_access.c
+index d212e51..7c10feb 100644
+--- a/godot-mesa/src/compiler/nir/nir_opt_access.c
++++ b/godot-mesa/src/compiler/nir/nir_opt_access.c
+@@ -164,6 +164,8 @@ gather_intrinsic(struct access_state *state, nir_intrinsic_instr *instr)
+    /* These are what SPIR-V to NIR generates, but they might be lowered later. */
+    case nir_intrinsic_trace_ray:
+    case nir_intrinsic_execute_callable:
++   case nir_intrinsic_hit_object_trace_ray:
++   case nir_intrinsic_hit_object_execute_shader:
+       state->has_calls = true;
+       break;
+ 
+diff --git a/godot-mesa/src/compiler/nir/nir_opt_combine_stores.c b/godot-mesa/src/compiler/nir/nir_opt_combine_stores.c
+index d3a1186..b992449 100644
+--- a/godot-mesa/src/compiler/nir/nir_opt_combine_stores.c
++++ b/godot-mesa/src/compiler/nir/nir_opt_combine_stores.c
+@@ -369,7 +369,9 @@ combine_stores_block(struct combine_stores_state *state, nir_block *block)
+       case nir_intrinsic_trace_ray:
+       case nir_intrinsic_execute_callable:
+       case nir_intrinsic_rt_trace_ray:
+-      case nir_intrinsic_rt_execute_callable: {
++      case nir_intrinsic_rt_execute_callable:
++      case nir_intrinsic_hit_object_trace_ray:
++      case nir_intrinsic_hit_object_execute_shader: {
+          nir_deref_instr *payload =
+             nir_src_as_deref(*nir_get_shader_call_payload_src(intrin));
+          combine_stores_with_deref(state, payload);
+diff --git a/godot-mesa/src/compiler/nir/nir_opt_copy_prop_vars.c b/godot-mesa/src/compiler/nir/nir_opt_copy_prop_vars.c
+index a382ccc..17aeca9 100644
+--- a/godot-mesa/src/compiler/nir/nir_opt_copy_prop_vars.c
++++ b/godot-mesa/src/compiler/nir/nir_opt_copy_prop_vars.c
+@@ -197,7 +197,9 @@ gather_vars_written(struct copy_prop_var_state *state,
+          case nir_intrinsic_trace_ray:
+          case nir_intrinsic_execute_callable:
+          case nir_intrinsic_rt_trace_ray:
+-         case nir_intrinsic_rt_execute_callable: {
++         case nir_intrinsic_rt_execute_callable:
++         case nir_intrinsic_hit_object_trace_ray:
++         case nir_intrinsic_hit_object_execute_shader: {
+             nir_deref_instr *payload =
+                nir_src_as_deref(*nir_get_shader_call_payload_src(intrin));
+ 
+@@ -1296,7 +1298,9 @@ copy_prop_vars_block(struct copy_prop_var_state *state,
+       case nir_intrinsic_trace_ray:
+       case nir_intrinsic_execute_callable:
+       case nir_intrinsic_rt_trace_ray:
+-      case nir_intrinsic_rt_execute_callable: {
++      case nir_intrinsic_rt_execute_callable:
++      case nir_intrinsic_hit_object_trace_ray:
++      case nir_intrinsic_hit_object_execute_shader: {
+          if (debug)
+             dump_instr(instr);
+ 
+diff --git a/godot-mesa/src/compiler/nir/nir_opt_dead_write_vars.c b/godot-mesa/src/compiler/nir/nir_opt_dead_write_vars.c
+index 1c3580d..1a4dbca 100644
+--- a/godot-mesa/src/compiler/nir/nir_opt_dead_write_vars.c
++++ b/godot-mesa/src/compiler/nir/nir_opt_dead_write_vars.c
+@@ -179,9 +179,11 @@ remove_dead_write_vars_local(nir_shader *shader, nir_block *block,
+       }
+ 
+       case nir_intrinsic_trace_ray:
+-      case nir_intrinsic_rt_trace_ray: {
++      case nir_intrinsic_rt_trace_ray:
++      case nir_intrinsic_hit_object_trace_ray:
++      case nir_intrinsic_hit_object_execute_shader: {
+          /* Mark payload as it can be used by the callees */
+-         nir_deref_instr *src = nir_src_as_deref(intrin->src[10]);
++         nir_deref_instr *src = nir_src_as_deref(*nir_get_shader_call_payload_src(intrin));
+          clear_unused_for_read(unused_writes, src);
+          break;
+       }
+diff --git a/godot-mesa/src/compiler/spirv/spirv.h b/godot-mesa/src/compiler/spirv/spirv.h
+index 308b68d..78d30a2 100644
+--- a/godot-mesa/src/compiler/spirv/spirv.h
++++ b/godot-mesa/src/compiler/spirv/spirv.h
+@@ -248,6 +248,7 @@ typedef enum SpvStorageClass_ {
+     SpvStorageClassPhysicalStorageBuffer = 5349,
+     SpvStorageClassPhysicalStorageBufferEXT = 5349,
+     SpvStorageClassHitObjectAttributeNV = 5385,
++    SpvStorageClassHitObjectAttributeEXT = 5411,
+     SpvStorageClassTaskPayloadWorkgroupEXT = 5402,
+     SpvStorageClassCodeSectionINTEL = 5605,
+     SpvStorageClassDeviceOnlyINTEL = 5936,
+@@ -573,6 +574,7 @@ typedef enum SpvDecoration_ {
+     SpvDecorationAliasedPointer = 5356,
+     SpvDecorationAliasedPointerEXT = 5356,
+     SpvDecorationHitObjectShaderRecordBufferNV = 5386,
++    SpvDecorationHitObjectShaderRecordBufferEXT = 5389,
+     SpvDecorationBindlessSamplerNV = 5398,
+     SpvDecorationBindlessImageNV = 5399,
+     SpvDecorationBoundSamplerNV = 5400,
+@@ -1188,6 +1190,7 @@ typedef enum SpvCapability_ {
+     SpvCapabilityDisplacementMicromapNV = 5380,
+     SpvCapabilityRayTracingOpacityMicromapEXT = 5381,
+     SpvCapabilityShaderInvocationReorderNV = 5383,
++    SpvCapabilityShaderInvocationReorderEXT = 5388,
+     SpvCapabilityBindlessTextureNV = 5390,
+     SpvCapabilityRayQueryPositionFetchKHR = 5391,
+     SpvCapabilityCooperativeVectorNV = 5394,
+@@ -2079,6 +2082,42 @@ typedef enum SpvOp_ {
+     SpvOpReorderThreadWithHitObjectNV = 5279,
+     SpvOpReorderThreadWithHintNV = 5280,
+     SpvOpTypeHitObjectNV = 5281,
++    SpvOpHitObjectRecordFromQueryEXT = 5304,
++    SpvOpHitObjectRecordMissEXT = 5305,
++    SpvOpHitObjectRecordMissMotionEXT = 5306,
++    SpvOpHitObjectGetIntersectionTriangleVertexPositionsEXT = 5307,
++    SpvOpHitObjectGetRayFlagsEXT = 5308,
++    SpvOpHitObjectSetShaderBindingTableRecordIndexEXT = 5309,
++    SpvOpHitObjectReorderExecuteShaderEXT = 5310,
++    SpvOpHitObjectTraceReorderExecuteEXT = 5311,
++    SpvOpHitObjectTraceMotionReorderExecuteEXT = 5312,
++    SpvOpTypeHitObjectEXT = 5313,
++    SpvOpReorderThreadWithHintEXT = 5314,
++    SpvOpReorderThreadWithHitObjectEXT = 5315,
++    SpvOpHitObjectTraceRayEXT = 5316,
++    SpvOpHitObjectTraceRayMotionEXT = 5317,
++    SpvOpHitObjectRecordEmptyEXT = 5318,
++    SpvOpHitObjectExecuteShaderEXT = 5319,
++    SpvOpHitObjectGetCurrentTimeEXT = 5320,
++    SpvOpHitObjectGetAttributesEXT = 5321,
++    SpvOpHitObjectGetHitKindEXT = 5322,
++    SpvOpHitObjectGetPrimitiveIndexEXT = 5323,
++    SpvOpHitObjectGetGeometryIndexEXT = 5324,
++    SpvOpHitObjectGetInstanceIdEXT = 5325,
++    SpvOpHitObjectGetInstanceCustomIndexEXT = 5326,
++    SpvOpHitObjectGetObjectRayOriginEXT = 5327,
++    SpvOpHitObjectGetObjectRayDirectionEXT = 5328,
++    SpvOpHitObjectGetWorldRayDirectionEXT = 5329,
++    SpvOpHitObjectGetWorldRayOriginEXT = 5330,
++    SpvOpHitObjectGetObjectToWorldEXT = 5331,
++    SpvOpHitObjectGetWorldToObjectEXT = 5332,
++    SpvOpHitObjectGetRayTMaxEXT = 5333,
++    SpvOpHitObjectGetRayTMinEXT = 5347,
++    SpvOpHitObjectGetShaderBindingTableRecordIndexEXT = 5348,
++    SpvOpHitObjectGetShaderRecordBufferHandleEXT = 5349,
++    SpvOpHitObjectIsEmptyEXT = 5350,
++    SpvOpHitObjectIsHitEXT = 5351,
++    SpvOpHitObjectIsMissEXT = 5352,
+     SpvOpImageSampleFootprintNV = 5283,
+     SpvOpTypeCooperativeVectorNV = 5288,
+     SpvOpCooperativeVectorMatrixMulNV = 5289,
+@@ -2915,6 +2954,42 @@ inline void SpvHasResultAndType(SpvOp opcode, bool *hasResult, bool *hasResultTy
+     case SpvOpReorderThreadWithHitObjectNV: *hasResult = false; *hasResultType = false; break;
+     case SpvOpReorderThreadWithHintNV: *hasResult = false; *hasResultType = false; break;
+     case SpvOpTypeHitObjectNV: *hasResult = true; *hasResultType = false; break;
++    case SpvOpHitObjectRecordFromQueryEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectRecordMissEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectRecordMissMotionEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectGetIntersectionTriangleVertexPositionsEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetRayFlagsEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectSetShaderBindingTableRecordIndexEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectReorderExecuteShaderEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectTraceReorderExecuteEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectTraceMotionReorderExecuteEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpTypeHitObjectEXT: *hasResult = true; *hasResultType = false; break;
++    case SpvOpReorderThreadWithHintEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpReorderThreadWithHitObjectEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectTraceRayEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectTraceRayMotionEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectRecordEmptyEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectExecuteShaderEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectGetCurrentTimeEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetAttributesEXT: *hasResult = false; *hasResultType = false; break;
++    case SpvOpHitObjectGetHitKindEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetPrimitiveIndexEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetGeometryIndexEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetInstanceIdEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetInstanceCustomIndexEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetObjectRayOriginEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetObjectRayDirectionEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetWorldRayDirectionEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetWorldRayOriginEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetObjectToWorldEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetWorldToObjectEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetRayTMaxEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetRayTMinEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetShaderBindingTableRecordIndexEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectGetShaderRecordBufferHandleEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectIsEmptyEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectIsHitEXT: *hasResult = true; *hasResultType = true; break;
++    case SpvOpHitObjectIsMissEXT: *hasResult = true; *hasResultType = true; break;
+     case SpvOpImageSampleFootprintNV: *hasResult = true; *hasResultType = true; break;
+     case SpvOpTypeCooperativeVectorNV: *hasResult = true; *hasResultType = false; break;
+     case SpvOpCooperativeVectorMatrixMulNV: *hasResult = true; *hasResultType = true; break;
+diff --git a/godot-mesa/src/compiler/spirv/spirv_info.c b/godot-mesa/src/compiler/spirv/spirv_info.c
+index 4a1fe82..6db2e28 100644
+--- a/godot-mesa/src/compiler/spirv/spirv_info.c
++++ b/godot-mesa/src/compiler/spirv/spirv_info.c
+@@ -205,6 +205,7 @@ spirv_capabilities_get(const struct spirv_capabilities *caps,
+    case SpvCapabilityDisplacementMicromapNV: return caps->DisplacementMicromapNV;
+    case SpvCapabilityRayTracingOpacityMicromapEXT: return caps->RayTracingOpacityMicromapEXT;
+    case SpvCapabilityShaderInvocationReorderNV: return caps->ShaderInvocationReorderNV;
++   case SpvCapabilityShaderInvocationReorderEXT: return caps->ShaderInvocationReorderEXT;
+    case SpvCapabilityBindlessTextureNV: return caps->BindlessTextureNV;
+    case SpvCapabilityRayQueryPositionFetchKHR: return caps->RayQueryPositionFetchKHR;
+    case SpvCapabilityCooperativeVectorNV: return caps->CooperativeVectorNV;
+@@ -488,6 +489,7 @@ spirv_capabilities_set(struct spirv_capabilities *caps,
+    case SpvCapabilityDisplacementMicromapNV: caps->DisplacementMicromapNV = enabled; break;
+    case SpvCapabilityRayTracingOpacityMicromapEXT: caps->RayTracingOpacityMicromapEXT = enabled; break;
+    case SpvCapabilityShaderInvocationReorderNV: caps->ShaderInvocationReorderNV = enabled; break;
++   case SpvCapabilityShaderInvocationReorderEXT: caps->ShaderInvocationReorderEXT = enabled; break;
+    case SpvCapabilityBindlessTextureNV: caps->BindlessTextureNV = enabled; break;
+    case SpvCapabilityRayQueryPositionFetchKHR: caps->RayQueryPositionFetchKHR = enabled; break;
+    case SpvCapabilityCooperativeVectorNV: caps->CooperativeVectorNV = enabled; break;
+@@ -921,6 +923,7 @@ spirv_capability_to_string(SpvCapability v)
+    case SpvCapabilityDisplacementMicromapNV: return "SpvCapabilityDisplacementMicromapNV";
+    case SpvCapabilityRayTracingOpacityMicromapEXT: return "SpvCapabilityRayTracingOpacityMicromapEXT";
+    case SpvCapabilityShaderInvocationReorderNV: return "SpvCapabilityShaderInvocationReorderNV";
++   case SpvCapabilityShaderInvocationReorderEXT: return "SpvCapabilityShaderInvocationReorderEXT";
+    case SpvCapabilityBindlessTextureNV: return "SpvCapabilityBindlessTextureNV";
+    case SpvCapabilityRayQueryPositionFetchKHR: return "SpvCapabilityRayQueryPositionFetchKHR";
+    case SpvCapabilityCooperativeVectorNV: return "SpvCapabilityCooperativeVectorNV";
+diff --git a/godot-mesa/src/compiler/spirv/spirv_info.h b/godot-mesa/src/compiler/spirv/spirv_info.h
+index f038744..d62140f 100644
+--- a/godot-mesa/src/compiler/spirv/spirv_info.h
++++ b/godot-mesa/src/compiler/spirv/spirv_info.h
+@@ -274,6 +274,7 @@ struct spirv_capabilities {
+    bool DisplacementMicromapNV;
+    bool RayTracingOpacityMicromapEXT;
+    bool ShaderInvocationReorderNV;
++   bool ShaderInvocationReorderEXT;
+    bool BindlessTextureNV;
+    bool RayQueryPositionFetchKHR;
+    bool CooperativeVectorNV;
+diff --git a/godot-mesa/src/compiler/spirv/spirv_to_nir.c b/godot-mesa/src/compiler/spirv/spirv_to_nir.c
+index cdb9e98..dfea47a 100644
+--- a/godot-mesa/src/compiler/spirv/spirv_to_nir.c
++++ b/godot-mesa/src/compiler/spirv/spirv_to_nir.c
+@@ -172,6 +172,7 @@ static const struct spirv_capabilities implemented_capabilities = {
+    .Shader = true,
+    .ShaderClockKHR = true,
+    .ShaderEnqueueAMDX = true,
++   .ShaderInvocationReorderEXT = true,
+    .ShaderLayer = true,
+    .ShaderNonUniformEXT = true,
+    .ShaderSMBuiltinsNV = true,
+@@ -454,6 +455,7 @@ vtn_base_type_to_string(enum vtn_base_type t)
+    CASE(sampled_image);
+    CASE(accel_struct);
+    CASE(ray_query);
++   CASE(hit_object);
+    CASE(function);
+    CASE(event);
+    CASE(cooperative_matrix);
+@@ -1255,6 +1257,7 @@ vtn_types_compatible(struct vtn_builder *b,
+ 
+    case vtn_base_type_accel_struct:
+    case vtn_base_type_ray_query:
++   case vtn_base_type_hit_object:
+       return true;
+ 
+    case vtn_base_type_function:
+@@ -1296,6 +1299,7 @@ vtn_type_copy(struct vtn_builder *b, struct vtn_type *src)
+    case vtn_base_type_event:
+    case vtn_base_type_accel_struct:
+    case vtn_base_type_ray_query:
++   case vtn_base_type_hit_object:
+    case vtn_base_type_cooperative_matrix:
+       /* Nothing more to do */
+       break;
+@@ -2385,6 +2389,12 @@ vtn_handle_type(struct vtn_builder *b, SpvOp opcode,
+       break;
+    }
+ 
++   case SpvOpTypeHitObjectEXT:
++      /* Opaque: only ever accessed through the hit object intrinsics. */
++      val->type->base_type = vtn_base_type_hit_object;
++      val->type->type = glsl_uint64_t_type();
++      break;
++
+    case SpvOpTypeCooperativeMatrixKHR:
+       vtn_handle_cooperative_type(b, val, opcode, w, count);
+       break;
+@@ -5660,6 +5670,7 @@ vtn_handle_variable_or_type_instruction(struct vtn_builder *b, SpvOp opcode,
+    case SpvOpTypePipe:
+    case SpvOpTypeAccelerationStructureKHR:
+    case SpvOpTypeRayQueryKHR:
++   case SpvOpTypeHitObjectEXT:
+    case SpvOpTypeCooperativeMatrixKHR:
+    case SpvOpTypeUntypedPointerKHR:
+       vtn_handle_type(b, opcode, w, count);
+@@ -6167,6 +6178,122 @@ vtn_handle_allocate_node_payloads(struct vtn_builder *b, SpvOp opcode,
+    nir_initialize_node_payloads(&b->nb, payloads, payload_count, node_index, .execution_scope = scope);
+ }
+ 
++static nir_def *
++hit_object_load(struct vtn_builder *b, nir_intrinsic_op op, uint32_t hit_object,
++                unsigned num_components, unsigned bit_size)
++{
++   nir_intrinsic_instr *intrin = nir_intrinsic_instr_create(b->nb.shader, op);
++   intrin->src[0] = nir_src_for_ssa(&vtn_nir_deref(b, hit_object)->def);
++   nir_def_init(&intrin->instr, &intrin->def, num_components, bit_size);
++   nir_builder_instr_insert(&b->nb, &intrin->instr);
++   return &intrin->def;
++}
++
++static void
++vtn_handle_hit_object_intrinsic(struct vtn_builder *b, SpvOp opcode,
++                                const uint32_t *w, unsigned count)
++{
++   nir_intrinsic_instr *intrin;
++
++   switch (opcode) {
++   case SpvOpHitObjectTraceRayEXT: {
++      intrin = nir_intrinsic_instr_create(b->nb.shader,
++                                          nir_intrinsic_hit_object_trace_ray);
++      intrin->src[0] = nir_src_for_ssa(&vtn_nir_deref(b, w[1])->def);
++      /* The other sources are in the same order as trace_ray's. */
++      for (unsigned i = 1; i < 11; i++)
++         intrin->src[i] = nir_src_for_ssa(vtn_ssa_value(b, w[i + 1])->def);
++      intrin->src[11] = nir_src_for_ssa(&vtn_nir_deref(b, w[12])->def);
++      nir_builder_instr_insert(&b->nb, &intrin->instr);
++      break;
++   }
++
++   case SpvOpHitObjectRecordEmptyEXT:
++      intrin = nir_intrinsic_instr_create(b->nb.shader,
++                                          nir_intrinsic_hit_object_record_empty);
++      intrin->src[0] = nir_src_for_ssa(&vtn_nir_deref(b, w[1])->def);
++      nir_builder_instr_insert(&b->nb, &intrin->instr);
++      break;
++
++   case SpvOpHitObjectExecuteShaderEXT:
++      intrin = nir_intrinsic_instr_create(b->nb.shader,
++                                          nir_intrinsic_hit_object_execute_shader);
++      intrin->src[0] = nir_src_for_ssa(&vtn_nir_deref(b, w[1])->def);
++      intrin->src[1] = nir_src_for_ssa(&vtn_nir_deref(b, w[2])->def);
++      nir_builder_instr_insert(&b->nb, &intrin->instr);
++      break;
++
++   case SpvOpReorderThreadWithHitObjectEXT:
++      intrin = nir_intrinsic_instr_create(b->nb.shader,
++                                          nir_intrinsic_hit_object_reorder_thread);
++      intrin->src[0] = nir_src_for_ssa(&vtn_nir_deref(b, w[1])->def);
++      /* The hint and its number of bits are optional. */
++      intrin->src[1] = nir_src_for_ssa(count > 3 ? vtn_ssa_value(b, w[2])->def : nir_imm_int(&b->nb, 0));
++      intrin->src[2] = nir_src_for_ssa(count > 3 ? vtn_ssa_value(b, w[3])->def : nir_imm_int(&b->nb, 0));
++      nir_builder_instr_insert(&b->nb, &intrin->instr);
++      break;
++
++   case SpvOpReorderThreadWithHintEXT:
++      intrin = nir_intrinsic_instr_create(b->nb.shader,
++                                          nir_intrinsic_reorder_thread_with_hint);
++      intrin->src[0] = nir_src_for_ssa(vtn_ssa_value(b, w[1])->def);
++      intrin->src[1] = nir_src_for_ssa(vtn_ssa_value(b, w[2])->def);
++      nir_builder_instr_insert(&b->nb, &intrin->instr);
++      break;
++
++   case SpvOpHitObjectIsHitEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_is_hit, w[3], 1, 1));
++      break;
++   case SpvOpHitObjectIsMissEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_is_miss, w[3], 1, 1));
++      break;
++   case SpvOpHitObjectIsEmptyEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_is_empty, w[3], 1, 1));
++      break;
++   case SpvOpHitObjectGetInstanceIdEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_instance_id, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetInstanceCustomIndexEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_instance_custom_index, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetPrimitiveIndexEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_primitive_index, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetGeometryIndexEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_geometry_index, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetHitKindEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_hit_kind, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetShaderBindingTableRecordIndexEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_sbt_record_index, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetRayFlagsEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_ray_flags, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetRayTMinEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_ray_tmin, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetRayTMaxEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_ray_tmax, w[3], 1, 32));
++      break;
++   case SpvOpHitObjectGetWorldRayOriginEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_world_ray_origin, w[3], 3, 32));
++      break;
++   case SpvOpHitObjectGetWorldRayDirectionEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_world_ray_direction, w[3], 3, 32));
++      break;
++   case SpvOpHitObjectGetObjectRayOriginEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_object_ray_origin, w[3], 3, 32));
++      break;
++   case SpvOpHitObjectGetObjectRayDirectionEXT:
++      vtn_push_nir_ssa(b, w[2], hit_object_load(b, nir_intrinsic_hit_object_get_object_ray_direction, w[3], 3, 32));
++      break;
++   default:
++      vtn_fail_with_opcode("Unsupported hit object opcode", opcode);
++   }
++}
++
+ static bool
+ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
+                             const uint32_t *w, unsigned count)
+@@ -6668,6 +6795,30 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
+       vtn_handle_ray_query_intrinsic(b, opcode, w, count);
+       break;
+ 
++   case SpvOpHitObjectTraceRayEXT:
++   case SpvOpHitObjectRecordEmptyEXT:
++   case SpvOpHitObjectExecuteShaderEXT:
++   case SpvOpReorderThreadWithHitObjectEXT:
++   case SpvOpReorderThreadWithHintEXT:
++   case SpvOpHitObjectIsHitEXT:
++   case SpvOpHitObjectIsMissEXT:
++   case SpvOpHitObjectIsEmptyEXT:
++   case SpvOpHitObjectGetInstanceIdEXT:
++   case SpvOpHitObjectGetInstanceCustomIndexEXT:
++   case SpvOpHitObjectGetPrimitiveIndexEXT:
++   case SpvOpHitObjectGetGeometryIndexEXT:
++   case SpvOpHitObjectGetHitKindEXT:
++   case SpvOpHitObjectGetShaderBindingTableRecordIndexEXT:
++   case SpvOpHitObjectGetRayFlagsEXT:
++   case SpvOpHitObjectGetRayTMinEXT:
++   case SpvOpHitObjectGetRayTMaxEXT:
++   case SpvOpHitObjectGetWorldRayOriginEXT:
++   case SpvOpHitObjectGetWorldRayDirectionEXT:
++   case SpvOpHitObjectGetObjectRayOriginEXT:
++   case SpvOpHitObjectGetObjectRayDirectionEXT:
++      vtn_handle_hit_object_intrinsic(b, opcode, w, count);
++      break;
++
+    case SpvOpLifetimeStart:
+    case SpvOpLifetimeStop:
+       break;
+diff --git a/godot-mesa/src/compiler/spirv/vtn_gather_types.c b/godot-mesa/src/compiler/spirv/vtn_gather_types.c
+index c276011..7b51777 100644
+--- a/godot-mesa/src/compiler/spirv/vtn_gather_types.c
++++ b/godot-mesa/src/compiler/spirv/vtn_gather_types.c
+@@ -420,6 +420,28 @@ result_type_args_for_opcode(SpvOp opcode)
+    case SpvOpHitObjectIsHitNV: return (struct type_args){ 1, 0 };
+    case SpvOpHitObjectIsMissNV: return (struct type_args){ 1, 0 };
+    case SpvOpTypeHitObjectNV: return (struct type_args){ 0, -1 };
++   case SpvOpTypeHitObjectEXT: return (struct type_args){ 0, -1 };
++   case SpvOpHitObjectGetIntersectionTriangleVertexPositionsEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetRayFlagsEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetCurrentTimeEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetHitKindEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetPrimitiveIndexEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetGeometryIndexEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetInstanceIdEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetInstanceCustomIndexEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetObjectRayOriginEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetObjectRayDirectionEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetWorldRayDirectionEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetWorldRayOriginEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetObjectToWorldEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetWorldToObjectEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetRayTMaxEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetRayTMinEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetShaderBindingTableRecordIndexEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectGetShaderRecordBufferHandleEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectIsEmptyEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectIsHitEXT: return (struct type_args){ 1, 0 };
++   case SpvOpHitObjectIsMissEXT: return (struct type_args){ 1, 0 };
+    case SpvOpImageSampleFootprintNV: return (struct type_args){ 1, 0 };
+    case SpvOpTypeCooperativeVectorNV: return (struct type_args){ 0, -1 };
+    case SpvOpCooperativeVectorMatrixMulNV: return (struct type_args){ 1, 0 };
+diff --git a/godot-mesa/src/compiler/spirv/vtn_private.h b/godot-mesa/src/compiler/spirv/vtn_private.h
+index 7fd12d8..05f9f2c 100644
+--- a/godot-mesa/src/compiler/spirv/vtn_private.h
++++ b/godot-mesa/src/compiler/spirv/vtn_private.h
+@@ -294,6 +294,7 @@ enum vtn_base_type {
+    vtn_base_type_sampled_image,
+    vtn_base_type_accel_struct,
+    vtn_base_type_ray_query,
++   vtn_base_type_hit_object,
+    vtn_base_type_function,
+    vtn_base_type_event,
+    vtn_base_type_cooperative_matrix,
+diff --git a/godot-mesa/src/compiler/spirv/vtn_variables.c b/godot-mesa/src/compiler/spirv/vtn_variables.c
+index 0fdb198..9951710 100644
+--- a/godot-mesa/src/compiler/spirv/vtn_variables.c
++++ b/godot-mesa/src/compiler/spirv/vtn_variables.c
+@@ -2230,6 +2230,7 @@ vtn_create_variable(struct vtn_builder *b, struct vtn_value *val,
+       var->var->data.mode = nir_mode;
+       var->var->data.location = -1;
+       var->var->data.ray_query = vtn_type_is_ray_query(var->type);
++      var->var->data.hit_object = vtn_type_without_array(var->type)->base_type == vtn_base_type_hit_object;
+       var->var->interface_type = NULL;
+       break;
+ 
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_container.c b/godot-mesa/src/microsoft/compiler/dxil_container.c
+index 2180527..f00dea4 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_container.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_container.c
+@@ -204,7 +204,9 @@ dxil_container_add_runtime_data(struct dxil_container *c,
+    func_info.base.feature_info_2 = feature_info >> 32;
+ 
+    uint32_t minor_version = 3;
+-   if (m->feats.sample_cmp_bias_gradient || m->feats.extended_command_info)
++   if (m->uses_hit_objects)
++      minor_version = 9;
++   else if (m->feats.sample_cmp_bias_gradient || m->feats.extended_command_info)
+       minor_version = 8;
+    else if (m->feats.advanced_texture_ops || m->feats.writable_msaa)
+       minor_version = 7;
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_function.c b/godot-mesa/src/microsoft/compiler/dxil_function.c
+index 73e821a..a355fc3 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_function.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_function.c
+@@ -138,6 +138,12 @@ static struct  predefined_func_descr predefined_funcs[] = {
+ {"dx.op.reportHit", "b", "ifi*s", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.callShader", "v", "ii*s", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.allocateRayQuery", "i", "ii", DXIL_ATTR_KIND_NO_UNWIND},
++{"dx.op.hitObject_TraceRay", "H", "i@iiiiiffffffff*s", DXIL_ATTR_KIND_NO_UNWIND},
++{"dx.op.hitObject_MakeNop", "H", "i", DXIL_ATTR_KIND_READ_NONE},
++{"dx.op.hitObject_Invoke", "v", "iH*s", DXIL_ATTR_KIND_NO_UNWIND},
++{"dx.op.maybeReorderThread", "v", "iHii", DXIL_ATTR_KIND_NO_UNWIND},
++{"dx.op.hitObject_StateScalar", "O", "iH", DXIL_ATTR_KIND_READ_NONE},
++{"dx.op.hitObject_StateVector", "O", "iHi", DXIL_ATTR_KIND_READ_NONE},
+ {"dx.op.rayQuery_TraceRayInline", "v", "ii@iiffffffff", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.rayQuery_Abort", "v", "ii", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.rayQuery_Proceed", "b", "ii", DXIL_ATTR_KIND_NO_UNWIND},
+@@ -282,6 +288,7 @@ get_type_from_string(struct dxil_module *mod, const char *param_descr,
+    }
+    case DXIL_FUNC_PARAM_STRUCT: return struct_type;
+    case DXIL_FUNC_PARAM_FOURI32: return dxil_module_get_fouri32_type(mod);
++   case DXIL_FUNC_PARAM_HIT_OBJECT: return dxil_module_get_hit_object_type(mod);
+    default:
+       assert(0 && "unknown type identifier");
+    }
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_function.h b/godot-mesa/src/microsoft/compiler/dxil_function.h
+index 9fc1168..0720ee1 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_function.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_function.h
+@@ -46,6 +46,7 @@
+ #define DXIL_FUNC_PARAM_RES_BIND '#'
+ #define DXIL_FUNC_PARAM_RES_PROPS 'P'
+ #define DXIL_FUNC_PARAM_FOURI32 'F'
++#define DXIL_FUNC_PARAM_HIT_OBJECT 'H'
+ 
+ #include "dxil_module.h"
+ #include "util/rb_tree.h"
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_module.c b/godot-mesa/src/microsoft/compiler/dxil_module.c
+index a6c0fb6..8ad0677 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_module.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_module.c
+@@ -704,6 +704,20 @@ dxil_module_get_handle_type(struct dxil_module *m)
+    return dxil_module_get_struct_type(m, "dx.types.Handle", &ptr_type, 1);
+ }
+ 
++const struct dxil_type *
++dxil_module_get_hit_object_type(struct dxil_module *m)
++{
++   const struct dxil_type *int8_type = get_int8_type(m);
++   if (!int8_type)
++      return NULL;
++
++   const struct dxil_type *ptr_type = dxil_module_get_pointer_type(m, int8_type);
++   if (!ptr_type)
++      return NULL;
++
++   return dxil_module_get_struct_type(m, "dx.types.HitObject", &ptr_type, 1);
++}
++
+ const struct dxil_type *
+ dxil_module_get_cbuf_ret_type(struct dxil_module *mod, enum overload_type overload)
+ {
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_module.h b/godot-mesa/src/microsoft/compiler/dxil_module.h
+index 9f1ab53..ec650cf 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_module.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_module.h
+@@ -213,6 +213,8 @@ struct dxil_module {
+    void *ralloc_ctx;
+    enum dxil_shader_kind shader_kind;
+    bool emit_library;
++   /* Hit objects (shader execution reordering) require shader model 6.9. */
++   bool uses_hit_objects;
+    unsigned major_version, minor_version;
+    unsigned major_validator, minor_validator;
+    struct dxil_features feats;
+@@ -357,6 +359,9 @@ dxil_get_overload_type(struct dxil_module *mod, enum overload_type overload);
+ const struct dxil_type *
+ dxil_module_get_handle_type(struct dxil_module *m);
+ 
++const struct dxil_type *
++dxil_module_get_hit_object_type(struct dxil_module *m);
++
+ const struct dxil_type *
+ dxil_module_get_cbuf_ret_type(struct dxil_module *mod, enum overload_type overload);
+ 
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_nir.c b/godot-mesa/src/microsoft/compiler/dxil_nir.c
+index a776c81..8ce8261 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_nir.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_nir.c
+@@ -2894,7 +2894,10 @@ lower_rt_payload_to_temp(nir_builder *b,
+ 
+    if (intr->intrinsic == nir_intrinsic_trace_ray) {
+       src_index = 10;
+-   } else if (intr->intrinsic == nir_intrinsic_execute_callable) {
++   } else if (intr->intrinsic == nir_intrinsic_hit_object_trace_ray) {
++      src_index = 11;
++   } else if (intr->intrinsic == nir_intrinsic_execute_callable ||
++              intr->intrinsic == nir_intrinsic_hit_object_execute_shader) {
+       src_index = 1;
+    } else {
+       return false;
+@@ -2973,7 +2976,10 @@ convert_rt_intrinsic_derefs_to_structs(struct nir_builder* b,
+ 
+    if (intr->intrinsic == nir_intrinsic_trace_ray) {
+       src_index = 10;
+-   } else if (intr->intrinsic == nir_intrinsic_execute_callable) {
++   } else if (intr->intrinsic == nir_intrinsic_hit_object_trace_ray) {
++      src_index = 11;
++   } else if (intr->intrinsic == nir_intrinsic_execute_callable ||
++              intr->intrinsic == nir_intrinsic_hit_object_execute_shader) {
+       src_index = 1;
+    } else {
+       return false;
+@@ -3101,6 +3107,12 @@ dxil_nir_wrap_rt_variables_in_structs(nir_shader* shader)
+             if (intr->intrinsic == nir_intrinsic_trace_ray) {
+                src_index = 10;
+                name_format = RAY_PAYLOAD;
++            } else if (intr->intrinsic == nir_intrinsic_hit_object_trace_ray) {
++               src_index = 11;
++               name_format = RAY_PAYLOAD;
++            } else if (intr->intrinsic == nir_intrinsic_hit_object_execute_shader) {
++               src_index = 1;
++               name_format = RAY_PAYLOAD;
+             } else if (intr->intrinsic == nir_intrinsic_execute_callable) {
+                src_index = 1;
+                name_format = CALLABLE_DATA;
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_versions.h b/godot-mesa/src/microsoft/compiler/dxil_versions.h
+index a13173d..74af97c 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_versions.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_versions.h
+@@ -38,6 +38,7 @@ enum dxil_shader_model {
+    SHADER_MODEL_6_6,
+    SHADER_MODEL_6_7,
+    SHADER_MODEL_6_8,
++   SHADER_MODEL_6_9,
+ };
+ 
+ enum dxil_validator_version {
+diff --git a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+index 3b11526..98c92cb 100644
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -421,6 +421,27 @@ enum dxil_intr {
+    DXIL_INTR_DOT4_ADD_I8_PACKED = 163,
+    DXIL_INTR_DOT4_ADD_U8_PACKED = 164,
+ 
++   DXIL_INTR_HIT_OBJECT_TRACE_RAY = 262,
++   DXIL_INTR_HIT_OBJECT_MAKE_NOP = 266,
++   DXIL_INTR_HIT_OBJECT_INVOKE = 267,
++   DXIL_INTR_MAYBE_REORDER_THREAD = 268,
++   DXIL_INTR_HIT_OBJECT_IS_MISS = 269,
++   DXIL_INTR_HIT_OBJECT_IS_HIT = 270,
++   DXIL_INTR_HIT_OBJECT_IS_NOP = 271,
++   DXIL_INTR_HIT_OBJECT_RAY_FLAGS = 272,
++   DXIL_INTR_HIT_OBJECT_RAY_T_MIN = 273,
++   DXIL_INTR_HIT_OBJECT_RAY_T_CURRENT = 274,
++   DXIL_INTR_HIT_OBJECT_WORLD_RAY_ORIGIN = 275,
++   DXIL_INTR_HIT_OBJECT_WORLD_RAY_DIRECTION = 276,
++   DXIL_INTR_HIT_OBJECT_OBJECT_RAY_ORIGIN = 277,
++   DXIL_INTR_HIT_OBJECT_OBJECT_RAY_DIRECTION = 278,
++   DXIL_INTR_HIT_OBJECT_GEOMETRY_INDEX = 281,
++   DXIL_INTR_HIT_OBJECT_INSTANCE_INDEX = 282,
++   DXIL_INTR_HIT_OBJECT_INSTANCE_ID = 283,
++   DXIL_INTR_HIT_OBJECT_PRIMITIVE_INDEX = 284,
++   DXIL_INTR_HIT_OBJECT_HIT_KIND = 285,
++   DXIL_INTR_HIT_OBJECT_SHADER_TABLE_INDEX = 286,
++
+    DXIL_INTR_ALLOCATE_RAY_QUERY = 178,
+    DXIL_INTR_TRACE_RAY_INLINE = 179,
+    DXIL_INTR_RAY_QUERY_PROCEED = 180,
+@@ -684,6 +705,9 @@ struct ntd_context {
+ 
+    const struct dxil_value **sharedvars;
+    const struct dxil_value **scratchvars;
++
++   /* Hit object variable -> struct hit_object_def. */
++   struct hash_table *hit_objects;
+    const struct dxil_value **consts;
+ 
+    nir_variable *system_value[SYSTEM_VALUE_MAX];
+@@ -5382,6 +5406,244 @@ emit_ray_call_void(struct ntd_context* ctx,
+    return dxil_emit_call_void(&ctx->mod, func, args, ARRAY_SIZE(args));
+ }
+ 
++/* A hit object is an SSA value in DXIL (%dx.types.HitObject) and a variable in
++ * SPIR-V and NIR. A read takes the value of the last write emitted before it,
++ * which must be the write that reaches it: it dominates the read, and no loop
++ * around the read but not around the write writes the hit object again (its
++ * back edge would carry that other value). Straight-line code, loops whose
++ * body writes the hit object before using it, and unrolled copies of such
++ * bodies satisfy this. Anything else would need phis of hit objects and is
++ * refused.
++ */
++struct hit_object_def {
++   const struct dxil_value *value;
++   nir_block *block;
++};
++
++static nir_variable *
++get_hit_object_var(struct ntd_context *ctx, nir_src *src)
++{
++   nir_deref_instr *deref = nir_src_as_deref(*src);
++   if (!deref || deref->deref_type != nir_deref_type_var || !deref->var->data.hit_object) {
++      ctx->logger->log(ctx->logger->priv, "Hit objects can only be accessed as whole variables\n");
++      return NULL;
++   }
++   return deref->var;
++}
++
++static nir_loop *
++get_enclosing_loop(nir_cf_node *node)
++{
++   for (node = node->parent; node; node = node->parent) {
++      if (node->type == nir_cf_node_loop)
++         return nir_cf_node_as_loop(node);
++   }
++   return NULL;
++}
++
++static bool
++cf_node_contains_block(nir_cf_node *node, nir_block *block)
++{
++   for (nir_cf_node *n = &block->cf_node; n; n = n->parent) {
++      if (n == node)
++         return true;
++   }
++   return false;
++}
++
++static bool
++loop_writes_hit_object(nir_loop *loop, nir_variable *var)
++{
++   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
++      nir_foreach_instr(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++         if (intr->intrinsic != nir_intrinsic_hit_object_trace_ray &&
++             intr->intrinsic != nir_intrinsic_hit_object_record_empty)
++            continue;
++         if (nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0])) == var)
++            return true;
++      }
++   }
++   return false;
++}
++
++static const struct dxil_value *
++get_hit_object(struct ntd_context *ctx, nir_intrinsic_instr *intr)
++{
++   nir_variable *var = get_hit_object_var(ctx, &intr->src[0]);
++   if (!var)
++      return NULL;
++
++   struct hash_entry *entry = _mesa_hash_table_search(ctx->hit_objects, var);
++   if (!entry) {
++      ctx->logger->log(ctx->logger->priv, "Hit object read before it is written\n");
++      return NULL;
++   }
++
++   const struct hit_object_def *def = entry->data;
++   nir_block *use_block = intr->instr.block;
++   nir_function_impl *impl = nir_cf_node_get_function(&use_block->cf_node);
++   nir_metadata_require(impl, nir_metadata_dominance);
++   if (!nir_block_dominates(def->block, use_block)) {
++      ctx->logger->log(ctx->logger->priv, "Hit object read where its last write does not dominate\n");
++      return NULL;
++   }
++
++   for (nir_loop *loop = get_enclosing_loop(&use_block->cf_node);
++        loop && !cf_node_contains_block(&loop->cf_node, def->block);
++        loop = get_enclosing_loop(&loop->cf_node)) {
++      if (loop_writes_hit_object(loop, var)) {
++         ctx->logger->log(ctx->logger->priv, "Hit object read where a write later in its loop can reach\n");
++         return NULL;
++      }
++   }
++   return def->value;
++}
++
++static bool
++set_hit_object(struct ntd_context *ctx, nir_intrinsic_instr *intr, const struct dxil_value *value)
++{
++   nir_variable *var = get_hit_object_var(ctx, &intr->src[0]);
++   if (!var || !value)
++      return false;
++
++   struct hit_object_def *def = ralloc(ctx->ralloc_ctx, struct hit_object_def);
++   def->value = value;
++   def->block = intr->instr.block;
++   _mesa_hash_table_insert(ctx->hit_objects, var, def);
++   ctx->mod.uses_hit_objects = true;
++   return true;
++}
++
++static const struct dxil_value *
++emit_hit_object_make_nop(struct ntd_context *ctx)
++{
++   const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.hitObject_MakeNop", DXIL_NONE);
++   if (!func)
++      return NULL;
++
++   const struct dxil_value *args[] = {
++      dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_HIT_OBJECT_MAKE_NOP),
++   };
++   if (!args[0])
++      return NULL;
++
++   return dxil_emit_call(&ctx->mod, func, args, ARRAY_SIZE(args));
++}
++
++static bool
++emit_hit_object_trace_ray(struct ntd_context *ctx, nir_intrinsic_instr *intr)
++{
++   nir_deref_instr *payload_deref = nir_src_as_deref(intr->src[11]);
++
++   const struct dxil_func *func = dxil_get_function_with_struct_type(&ctx->mod, "dx.op.hitObject_TraceRay",
++                                                                     get_type_for_glsl_type(&ctx->mod, payload_deref->type));
++   if (!func)
++      return false;
++
++   const struct dxil_value *args[] = {
++      dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_HIT_OBJECT_TRACE_RAY),
++      get_resource_handle(ctx, &intr->src[1], DXIL_RESOURCE_CLASS_SRV, DXIL_RESOURCE_KIND_RAYTRACING_ACCELERATION_STRUCTURE),
++      get_src(ctx, &intr->src[2], 0, nir_type_int),
++      get_src(ctx, &intr->src[3], 0, nir_type_int),
++      get_src(ctx, &intr->src[4], 0, nir_type_int),
++      get_src(ctx, &intr->src[5], 0, nir_type_int),
++      get_src(ctx, &intr->src[6], 0, nir_type_int),
++      get_src(ctx, &intr->src[7], 0, nir_type_float),
++      get_src(ctx, &intr->src[7], 1, nir_type_float),
++      get_src(ctx, &intr->src[7], 2, nir_type_float),
++      get_src(ctx, &intr->src[8], 0, nir_type_float),
++      get_src(ctx, &intr->src[9], 0, nir_type_float),
++      get_src(ctx, &intr->src[9], 1, nir_type_float),
++      get_src(ctx, &intr->src[9], 2, nir_type_float),
++      get_src(ctx, &intr->src[10], 0, nir_type_float),
++      ctx->scratchvars[payload_deref->var->data.driver_location]
++   };
++
++   for (unsigned i = 0; i < ARRAY_SIZE(args); i++) {
++      if (!args[i])
++         return false;
++   }
++
++   return set_hit_object(ctx, intr, dxil_emit_call(&ctx->mod, func, args, ARRAY_SIZE(args)));
++}
++
++static bool
++emit_hit_object_execute_shader(struct ntd_context *ctx, nir_intrinsic_instr *intr)
++{
++   nir_deref_instr *payload_deref = nir_src_as_deref(intr->src[1]);
++
++   const struct dxil_func *func = dxil_get_function_with_struct_type(&ctx->mod, "dx.op.hitObject_Invoke",
++                                                                     get_type_for_glsl_type(&ctx->mod, payload_deref->type));
++   if (!func)
++      return false;
++
++   const struct dxil_value *args[] = {
++      dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_HIT_OBJECT_INVOKE),
++      get_hit_object(ctx, intr),
++      ctx->scratchvars[payload_deref->var->data.driver_location]
++   };
++
++   if (!args[0] || !args[1] || !args[2])
++      return false;
++
++   return dxil_emit_call_void(&ctx->mod, func, args, ARRAY_SIZE(args));
++}
++
++static bool
++emit_maybe_reorder_thread(struct ntd_context *ctx, const struct dxil_value *hit_object,
++                          nir_src *hint, nir_src *hint_bits)
++{
++   const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.maybeReorderThread", DXIL_NONE);
++   if (!func)
++      return false;
++
++   const struct dxil_value *args[] = {
++      dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_MAYBE_REORDER_THREAD),
++      hit_object,
++      get_src(ctx, hint, 0, nir_type_uint),
++      get_src(ctx, hint_bits, 0, nir_type_uint),
++   };
++
++   if (!args[0] || !args[1] || !args[2] || !args[3])
++      return false;
++
++   ctx->mod.uses_hit_objects = true;
++   return dxil_emit_call_void(&ctx->mod, func, args, ARRAY_SIZE(args));
++}
++
++static bool
++emit_hit_object_load(struct ntd_context *ctx, nir_intrinsic_instr *intr,
++                     int32_t dxil_intr, enum overload_type overload, bool vector)
++{
++   const struct dxil_func *func = dxil_get_function(&ctx->mod,
++                                                    vector ? "dx.op.hitObject_StateVector" : "dx.op.hitObject_StateScalar",
++                                                    overload);
++   const struct dxil_value *opcode = dxil_module_get_int32_const(&ctx->mod, dxil_intr);
++   const struct dxil_value *hit_object = get_hit_object(ctx, intr);
++   if (!func || !opcode || !hit_object)
++      return false;
++
++   for (unsigned i = 0; i < intr->def.num_components; i++) {
++      const struct dxil_value *args[] = {
++         opcode,
++         hit_object,
++         dxil_module_get_int32_const(&ctx->mod, i),
++      };
++      if (!args[2])
++         return false;
++
++      const struct dxil_value *value = dxil_emit_call(&ctx->mod, func, args, vector ? 3 : 2);
++      if (!value)
++         return false;
++
++      store_def(ctx, &intr->def, i, value);
++   }
++   return true;
++}
++
+ static bool
+ emit_rq_initialize(struct ntd_context* ctx, nir_intrinsic_instr* intr)
+ {
+@@ -5932,6 +6194,52 @@ emit_intrinsic(struct ntd_context *ctx, nir_intrinsic_instr *intr)
+       return emit_report_ray_intersection(ctx, intr);
+    case nir_intrinsic_execute_callable:
+       return emit_execute_callable(ctx, intr);
++   case nir_intrinsic_hit_object_trace_ray:
++      return emit_hit_object_trace_ray(ctx, intr);
++   case nir_intrinsic_hit_object_record_empty:
++      return set_hit_object(ctx, intr, emit_hit_object_make_nop(ctx));
++   case nir_intrinsic_hit_object_execute_shader:
++      return emit_hit_object_execute_shader(ctx, intr);
++   case nir_intrinsic_hit_object_reorder_thread: {
++      const struct dxil_value *hit_object = get_hit_object(ctx, intr);
++      return hit_object && emit_maybe_reorder_thread(ctx, hit_object, &intr->src[1], &intr->src[2]);
++   }
++   case nir_intrinsic_reorder_thread_with_hint: {
++      const struct dxil_value *nop = emit_hit_object_make_nop(ctx);
++      return nop && emit_maybe_reorder_thread(ctx, nop, &intr->src[0], &intr->src[1]);
++   }
++   case nir_intrinsic_hit_object_is_hit:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_IS_HIT, DXIL_I1, false);
++   case nir_intrinsic_hit_object_is_miss:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_IS_MISS, DXIL_I1, false);
++   case nir_intrinsic_hit_object_is_empty:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_IS_NOP, DXIL_I1, false);
++   case nir_intrinsic_hit_object_get_instance_id:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_INSTANCE_INDEX, DXIL_I32, false);
++   case nir_intrinsic_hit_object_get_instance_custom_index:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_INSTANCE_ID, DXIL_I32, false);
++   case nir_intrinsic_hit_object_get_primitive_index:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_PRIMITIVE_INDEX, DXIL_I32, false);
++   case nir_intrinsic_hit_object_get_geometry_index:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_GEOMETRY_INDEX, DXIL_I32, false);
++   case nir_intrinsic_hit_object_get_hit_kind:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_HIT_KIND, DXIL_I32, false);
++   case nir_intrinsic_hit_object_get_sbt_record_index:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_SHADER_TABLE_INDEX, DXIL_I32, false);
++   case nir_intrinsic_hit_object_get_ray_flags:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_RAY_FLAGS, DXIL_I32, false);
++   case nir_intrinsic_hit_object_get_ray_tmin:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_RAY_T_MIN, DXIL_F32, false);
++   case nir_intrinsic_hit_object_get_ray_tmax:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_RAY_T_CURRENT, DXIL_F32, false);
++   case nir_intrinsic_hit_object_get_world_ray_origin:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_WORLD_RAY_ORIGIN, DXIL_F32, true);
++   case nir_intrinsic_hit_object_get_world_ray_direction:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_WORLD_RAY_DIRECTION, DXIL_F32, true);
++   case nir_intrinsic_hit_object_get_object_ray_origin:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_OBJECT_RAY_ORIGIN, DXIL_F32, true);
++   case nir_intrinsic_hit_object_get_object_ray_direction:
++      return emit_hit_object_load(ctx, intr, DXIL_INTR_HIT_OBJECT_OBJECT_RAY_DIRECTION, DXIL_F32, true);
+    case nir_intrinsic_rq_initialize:
+       ctx->mod.feats.raytracing_tier_1_1 = 1;
+       return emit_rq_initialize(ctx, intr);
+@@ -6943,6 +7251,11 @@ emit_cbvs(struct ntd_context *ctx)
+ static bool
+ emit_scratch_var(struct ntd_context *ctx, nir_variable* var)
+ {
++   if (var->data.hit_object) {
++      ctx->scratchvars[var->data.driver_location] = NULL;
++      return true;
++   }
++
+    const struct dxil_type *type = get_type_for_glsl_type(&ctx->mod, var->type);
+    const struct dxil_value *length = dxil_module_get_int32_const(&ctx->mod, 1);
+    const struct dxil_value *ptr = dxil_emit_alloca(&ctx->mod, type, length, 16);
+@@ -7378,6 +7691,12 @@ emit_module(struct ntd_context *ctx, const struct nir_to_dxil_options *opts)
+       return false;
+    }
+ 
++   if (ctx->mod.uses_hit_objects && ctx->mod.minor_version < 9) {
++      ctx->logger->log(ctx->logger->priv,
++                       "Shader uses hit objects, which require shader model 6.9, but 6.9 is unsupported\n");
++      return false;
++   }
++
+    if (ctx->mod.feats.raytracing_tier_1_1 && ctx->mod.minor_version < 5) {
+       ctx->logger->log(ctx->logger->priv,
+                        "Shader uses raytracing tier 1.1, which requires shader model 6.5, but 6.5 is unsupported\n");
+@@ -7787,7 +8106,7 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
+ static const unsigned dxil_validator_min_capable_version = DXIL_VALIDATOR_1_4;
+ static const unsigned dxil_validator_max_capable_version = DXIL_VALIDATOR_1_8;
+ static const unsigned dxil_min_shader_model = SHADER_MODEL_6_0;
+-static const unsigned dxil_max_shader_model = SHADER_MODEL_6_8;
++static const unsigned dxil_max_shader_model = SHADER_MODEL_6_9;
+ 
+ bool
+ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
+@@ -7853,12 +8172,17 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
+    util_dynarray_init(&ctx->cbv_metadata_nodes, ctx->ralloc_ctx);
+    util_dynarray_init(&ctx->sampler_metadata_nodes, ctx->ralloc_ctx);
+    util_dynarray_init(&ctx->resources, ctx->ralloc_ctx);
++   ctx->hit_objects = _mesa_pointer_hash_table_create(ctx->ralloc_ctx);
+    dxil_module_init(&ctx->mod, ctx->ralloc_ctx);
+    ctx->mod.shader_kind = get_dxil_shader_kind(s);
+    ctx->mod.emit_library = emit_library;
+    ctx->mod.major_version = 6;
+-   /* Use the highest shader model that's supported and can be validated */
+-   ctx->mod.minor_version =
++   /* Use the highest shader model that's supported and can be validated.
++    * Without validation, the highest supported: shader model 6.9 (hit objects)
++    * is newer than the newest validator this writes for.
++    */
++   ctx->mod.minor_version = opts->validator_version_max == NO_DXIL_VALIDATION ?
++      opts->shader_model_max & 0xffff :
+       MIN2(opts->shader_model_max & 0xffff, validator_version & 0xffff);
+    ctx->mod.major_validator = validator_version >> 16;
+    ctx->mod.minor_validator = validator_version & 0xffff;
