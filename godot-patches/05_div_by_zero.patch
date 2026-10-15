@@ -1,0 +1,100 @@
+diff --git a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+index 4bab709..213e94f 100644
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -2696,6 +2696,71 @@ emit_shift(struct ntd_context *ctx, nir_alu_instr *alu,
+    return true;
+ }
+ 
++/* idiv, udiv, irem, imod, umod. NIR defines a division or remainder by 0 as 0 and lets its optimizations hoist one out
++ * of a branch that tests the divisor; DXIL leaves it undefined (UDiv gives ~0 on D3D, and a driver may assume that a
++ * divisor is never 0). A divisor that can be 0 is replaced with 1 and the result with 0. imod was emitted as URem.
++ */
++static bool
++emit_div_rem(struct ntd_context *ctx, nir_alu_instr *alu,
++             const struct dxil_value *op0, const struct dxil_value *op1)
++{
++   const unsigned bit_size = alu->def.bit_size;
++   const struct dxil_value *zero = dxil_module_get_int_const(&ctx->mod, 0, bit_size);
++   const struct dxil_value *is_zero = NULL;
++
++   if (nir_src_is_const(alu->src[1].src)) {
++      /* It's illegal to emit a literal divide by 0 in DXIL */
++      nir_scalar divisor = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 1);
++      if (nir_scalar_as_int(divisor) == 0) {
++         store_alu_dest(ctx, alu, 0, zero);
++         return true;
++      }
++   } else {
++      is_zero = dxil_emit_cmp(&ctx->mod, DXIL_ICMP_EQ, op1, zero);
++      if (!is_zero)
++         return false;
++      op1 = dxil_emit_select(&ctx->mod, is_zero, dxil_module_get_int_const(&ctx->mod, 1, bit_size), op1);
++      if (!op1)
++         return false;
++   }
++
++   enum dxil_bin_opcode opcode;
++   switch (alu->op) {
++   case nir_op_idiv: opcode = DXIL_BINOP_SDIV; break;
++   case nir_op_udiv: opcode = DXIL_BINOP_UDIV; break;
++   case nir_op_irem:
++   case nir_op_imod: opcode = DXIL_BINOP_SREM; break;
++   case nir_op_umod: opcode = DXIL_BINOP_UREM; break;
++   default: UNREACHABLE("not a division");
++   }
++
++   const struct dxil_value *v = dxil_emit_binop(&ctx->mod, opcode, op0, op1, 0);
++   if (!v)
++      return false;
++
++   if (alu->op == nir_op_imod) {
++      /* imod takes the sign of the divisor: a non-zero remainder of the other sign gets the divisor added. */
++      const struct dxil_value *sign_differs = dxil_emit_cmp(&ctx->mod, DXIL_ICMP_SLT,
++         dxil_emit_binop(&ctx->mod, DXIL_BINOP_XOR, v, op1, 0), zero);
++      const struct dxil_value *nonzero = dxil_emit_cmp(&ctx->mod, DXIL_ICMP_NE, v, zero);
++      const struct dxil_value *adjust = dxil_emit_binop(&ctx->mod, DXIL_BINOP_AND, sign_differs, nonzero, 0);
++      if (!adjust)
++         return false;
++      v = dxil_emit_select(&ctx->mod, adjust, dxil_emit_binop(&ctx->mod, DXIL_BINOP_ADD, v, op1, 0), v);
++      if (!v)
++         return false;
++   }
++
++   if (is_zero) {
++      v = dxil_emit_select(&ctx->mod, is_zero, zero, v);
++      if (!v)
++         return false;
++   }
++
++   store_alu_dest(ctx, alu, 0, v);
++   return true;
++}
++
+ static bool
+ emit_cmp(struct ntd_context *ctx, nir_alu_instr *alu,
+          enum dxil_cmp_pred pred,
+@@ -3303,20 +3368,9 @@ emit_alu(struct ntd_context *ctx, nir_alu_instr *alu)
+ 
+    case nir_op_idiv:
+    case nir_op_udiv:
+-      if (nir_src_is_const(alu->src[1].src)) {
+-         /* It's illegal to emit a literal divide by 0 in DXIL */
+-         nir_scalar divisor = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 1);
+-         if (nir_scalar_as_int(divisor) == 0) {
+-            store_alu_dest(ctx, alu, 0,
+-                           dxil_module_get_int_const(&ctx->mod, 0, alu->def.bit_size));
+-            return true;
+-         }
+-      }
+-      return emit_binop(ctx, alu, alu->op == nir_op_idiv ? DXIL_BINOP_SDIV : DXIL_BINOP_UDIV, src[0], src[1]);
+-
+-   case nir_op_irem: return emit_binop(ctx, alu, DXIL_BINOP_SREM, src[0], src[1]);
+-   case nir_op_imod: return emit_binop(ctx, alu, DXIL_BINOP_UREM, src[0], src[1]);
+-   case nir_op_umod: return emit_binop(ctx, alu, DXIL_BINOP_UREM, src[0], src[1]);
++   case nir_op_irem:
++   case nir_op_imod:
++   case nir_op_umod: return emit_div_rem(ctx, alu, src[0], src[1]);
+    case nir_op_ishl: return emit_shift(ctx, alu, DXIL_BINOP_SHL, src[0], src[1]);
+    case nir_op_ishr: return emit_shift(ctx, alu, DXIL_BINOP_ASHR, src[0], src[1]);
+    case nir_op_ushr: return emit_shift(ctx, alu, DXIL_BINOP_LSHR, src[0], src[1]);
