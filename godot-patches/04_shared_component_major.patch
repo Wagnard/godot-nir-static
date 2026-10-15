@@ -1,0 +1,50 @@
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_nir.c b/godot-mesa/src/microsoft/compiler/dxil_nir.c
+index 8ce8261..fad62e1 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_nir.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_nir.c
+@@ -153,6 +153,15 @@ flatten_var_arrays(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    nir_deref_path_init(&path, deref, NULL);
+ 
+    assert(path.path[0]->deref_type == nir_deref_type_var);
++   /* Shared memory keeps each component of an array of vectors in a slice of its own (component c of vector i at
++    * i + c * vector count) instead of interleaving them: the 32-bit accesses a vector access becomes then reach
++    * consecutive banks for consecutive vectors, not every fourth one, as a vector access does with SPIR-V.
++    */
++   const struct glsl_type *leaf_type = glsl_without_array(path.path[0]->type);
++   const bool component_major = var->data.mode == nir_var_mem_shared && glsl_type_is_vector(leaf_type);
++   const unsigned vector_size = component_major ? glsl_get_vector_elements(leaf_type) : 1;
++   const unsigned component_stride = component_major ? glsl_get_component_slots(path.path[0]->type) / vector_size : 1;
++
+    b->cursor = nir_before_instr(&path.path[0]->instr);
+    nir_deref_instr *new_var_deref = nir_build_deref_var(b, var);
+    nir_def *index = NULL;
+@@ -160,8 +169,10 @@ flatten_var_arrays(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+       nir_deref_instr *arr_deref = path.path[level];
+       assert(arr_deref->deref_type == nir_deref_type_array);
+       b->cursor = nir_before_instr(&arr_deref->instr);
++      /* In a slice, an element of an array of vectors counts its vectors, and a component moves to its slice. */
++      const bool component_deref = component_major && glsl_type_is_vector(path.path[level - 1]->type);
+       nir_def *val = nir_imul_imm(b, arr_deref->arr.index.ssa,
+-                                      glsl_get_component_slots(arr_deref->type));
++                                  component_deref ? component_stride : glsl_get_component_slots(arr_deref->type) / vector_size);
+       if (index) {
+          index = nir_iadd(b, index, val);
+       } else {
+@@ -175,7 +186,7 @@ flatten_var_arrays(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+       if (intr->intrinsic == nir_intrinsic_load_deref) {
+          nir_def *components[NIR_MAX_VEC_COMPONENTS];
+          for (unsigned i = 0; i < vector_comps; ++i) {
+-            nir_def *final_index = index ? nir_iadd_imm(b, index, i) : nir_imm_int(b, i);
++            nir_def *final_index = index ? nir_iadd_imm(b, index, i * component_stride) : nir_imm_int(b, i * component_stride);
+             nir_deref_instr *comp_deref = nir_build_deref_array(b, new_var_deref, final_index);
+             components[i] = nir_load_deref(b, comp_deref);
+          }
+@@ -184,7 +195,7 @@ flatten_var_arrays(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+          for (unsigned i = 0; i < vector_comps; ++i) {
+             if (((1 << i) & nir_intrinsic_write_mask(intr)) == 0)
+                continue;
+-            nir_def *final_index = index ? nir_iadd_imm(b, index, i) : nir_imm_int(b, i);
++            nir_def *final_index = index ? nir_iadd_imm(b, index, i * component_stride) : nir_imm_int(b, i * component_stride);
+             nir_deref_instr *comp_deref = nir_build_deref_array(b, new_var_deref, final_index);
+             nir_store_deref(b, comp_deref, nir_channel(b, intr->src[1].ssa, i), 1);
+          }
