@@ -1,0 +1,115 @@
+diff --git a/godot-mesa/src/compiler/spirv/spirv_to_nir.c b/godot-mesa/src/compiler/spirv/spirv_to_nir.c
+index ddb7032..e6b497d 100644
+--- a/godot-mesa/src/compiler/spirv/spirv_to_nir.c
++++ b/godot-mesa/src/compiler/spirv/spirv_to_nir.c
+@@ -155,6 +155,8 @@ static const struct spirv_capabilities implemented_capabilities = {
+    .RayQueryKHR = true,
+    .RayQueryPositionFetchKHR = true,
+    .RayTracingKHR = true,
++   /* Its ray flag (ForceOpacityMicromap2StateEXT, 0x400) passes through: DXIL's is the same bit. */
++   .RayTracingOpacityMicromapEXT = true,
+    .RayTracingPositionFetchKHR = true,
+    .RayTraversalPrimitiveCullingKHR = true,
+    .ReplicatedCompositesEXT = true,
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_function.c b/godot-mesa/src/microsoft/compiler/dxil_function.c
+index ead7b2b..aecaa3e 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_function.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_function.c
+@@ -138,6 +138,7 @@ static struct  predefined_func_descr predefined_funcs[] = {
+ {"dx.op.reportHit", "b", "ifi*s", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.callShader", "v", "ii*s", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.allocateRayQuery", "i", "ii", DXIL_ATTR_KIND_NO_UNWIND},
++{"dx.op.allocateRayQuery2", "i", "iii", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.hitObject_TraceRay", "H", "i@iiiiiffffffff*s", DXIL_ATTR_KIND_NO_UNWIND},
+ {"dx.op.hitObject_MakeNop", "H", "i", DXIL_ATTR_KIND_READ_NONE},
+ {"dx.op.hitObject_Invoke", "v", "iH*s", DXIL_ATTR_KIND_NO_UNWIND},
+diff --git a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+index 213e94f..0a94652 100644
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -443,6 +443,7 @@ enum dxil_intr {
+    DXIL_INTR_HIT_OBJECT_SHADER_TABLE_INDEX = 286,
+ 
+    DXIL_INTR_ALLOCATE_RAY_QUERY = 178,
++   DXIL_INTR_ALLOCATE_RAY_QUERY_2 = 258,
+    DXIL_INTR_TRACE_RAY_INLINE = 179,
+    DXIL_INTR_RAY_QUERY_PROCEED = 180,
+    DXIL_INTR_RAY_QUERY_ABORT = 181,
+@@ -6363,19 +6364,38 @@ emit_deref(struct ntd_context* ctx, nir_deref_instr* instr)
+       switch (instr->deref_type) {
+       case nir_deref_type_var:
+          if (var->data.ray_query) {
+-            const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.allocateRayQuery", DXIL_NONE);
+-            if (!func)
+-               return false;
+-
+-            const struct dxil_value *args[] = {
+-               dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_ALLOCATE_RAY_QUERY),
+-               dxil_module_get_int32_const(&ctx->mod, 0),
+-            };
+-
+-            if (!args[0] || !args[1])
+-               return false;
+-
+-            const struct dxil_value *value = dxil_emit_call(&ctx->mod, func, args, ARRAY_SIZE(args));
++            const struct dxil_value *value;
++            if (ctx->opts->ray_query_allow_opacity_micromaps) {
++               /* AllocateRayQuery2(constRayFlags, RayQueryFlags): RayQueryFlag::AllowOpacityMicromaps = 1. */
++               const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.allocateRayQuery2", DXIL_NONE);
++               if (!func)
++                  return false;
++
++               const struct dxil_value *args[] = {
++                  dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_ALLOCATE_RAY_QUERY_2),
++                  dxil_module_get_int32_const(&ctx->mod, 0),
++                  dxil_module_get_int32_const(&ctx->mod, 1),
++               };
++
++               if (!args[0] || !args[1] || !args[2])
++                  return false;
++
++               value = dxil_emit_call(&ctx->mod, func, args, ARRAY_SIZE(args));
++            } else {
++               const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.allocateRayQuery", DXIL_NONE);
++               if (!func)
++                  return false;
++
++               const struct dxil_value *args[] = {
++                  dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_ALLOCATE_RAY_QUERY),
++                  dxil_module_get_int32_const(&ctx->mod, 0),
++               };
++
++               if (!args[0] || !args[1])
++                  return false;
++
++               value = dxil_emit_call(&ctx->mod, func, args, ARRAY_SIZE(args));
++            }
+             if (!value)
+                return false;
+ 
+@@ -8191,6 +8211,11 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
+       return false;
+    }
+ 
++   if (opts->ray_query_allow_opacity_micromaps && opts->shader_model_max < SHADER_MODEL_6_9) {
++      debug_printf("D3D12: ray queries that allow opacity micromaps need shader model 6.9\n");
++      return false;
++   }
++
+    if (opts->validator_version_max != NO_DXIL_VALIDATION &&
+        opts->validator_version_max < dxil_validator_min_capable_version) {
+       debug_printf("D3D12: Invalid validator version %d.%d, must be 1.4 or greater\n",
+diff --git a/godot-mesa/src/microsoft/compiler/nir_to_dxil.h b/godot-mesa/src/microsoft/compiler/nir_to_dxil.h
+index abe9e9d..240437d 100644
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.h
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.h
+@@ -90,6 +90,9 @@ struct nir_to_dxil_options {
+    enum dxil_shader_model shader_model_max;
+    enum dxil_validator_version validator_version_max;
+    const GodotNirCallbacks *godot_nir_callbacks;
++   /* Ray queries are allocated with AllocateRayQuery2 and AllowOpacityMicromaps (Shader Model 6.9): with
++    * AllocateRayQuery, meeting a geometry that references an opacity micromap array is undefined. */
++   bool ray_query_allow_opacity_micromaps;
+ };
+ 
+ typedef void (*dxil_msg_callback)(void *priv, const char *msg);
