@@ -1,0 +1,71 @@
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -6539,6 +6539,26 @@
+    return true;
+ }
+ 
++/* A block nothing branches to, closing a loop body or an if branch whose code all ended in jumps (the block NIR
++ * keeps after an if whose two sides break or continue). It holds only constants for the phis of its successor
++ * (dxil_nir_move_consts puts them there) and its jump, implicit or explicit, so it is not emitted: DXC never
++ * produces blocks without predecessors, and phis drop their edge from it.
++ */
++static bool
++is_skipped_block(nir_block *block)
++{
++   if (block->predecessors.entries != 0)
++      return false;
++   nir_foreach_instr(instr, block) {
++      if (instr->type != nir_instr_type_load_const &&
++          !(instr->type == nir_instr_type_jump && instr == nir_block_last_instr(block)))
++         return false;
++   }
++   if (block == nir_start_block(nir_cf_node_get_function(&block->cf_node)))
++      return false;
++   return exec_node_is_tail_sentinel(block->cf_node.node.next);
++}
++
+ static bool
+ fixup_phi(struct ntd_context *ctx, nir_phi_instr *instr,
+           struct phi_block *vphi)
+@@ -6548,6 +6568,8 @@
+    for (unsigned i = 0; i < vphi->num_components; ++i) {
+       size_t num_incoming = 0;
+       nir_foreach_phi_src(src, instr) {
++         if (is_skipped_block(src->pred))
++            continue;
+          const struct dxil_value *val = get_src_ssa(ctx, src->src.ssa, i);
+          values[num_incoming] = val;
+          blocks[num_incoming] = src->pred->index;
+@@ -7197,6 +7219,7 @@
+    /* handle then-block */
+    if (!emit_cf_list(ctx, &if_stmt->then_list) ||
+        (!nir_block_ends_in_jump(nir_if_last_then_block(if_stmt)) &&
++        !is_skipped_block(nir_if_last_then_block(if_stmt)) &&
+         !emit_branch(ctx, then_succ)))
+       return false;
+ 
+@@ -7204,6 +7227,7 @@
+       /* handle else-block */
+       if (!emit_cf_list(ctx, &if_stmt->else_list) ||
+           (!nir_block_ends_in_jump(nir_if_last_else_block(if_stmt)) &&
++           !is_skipped_block(nir_if_last_else_block(if_stmt)) &&
+            !emit_branch(ctx, else_succ)))
+          return false;
+    }
+@@ -7232,6 +7256,7 @@
+     */
+    nir_instr *last_instr = nir_block_last_instr(last_block);
+    if ((!last_instr || last_instr->type != nir_instr_type_jump) &&
++       !is_skipped_block(last_block) &&
+        !emit_branch(ctx, first_block->index))
+       return false;
+ 
+@@ -7244,6 +7269,8 @@
+    foreach_list_typed(nir_cf_node, node, node, list) {
+       switch (node->type) {
+       case nir_cf_node_block:
++         if (is_skipped_block(nir_cf_node_as_block(node)))
++            break;
+          if (!emit_block(ctx, nir_cf_node_as_block(node)))
+             return false;
+          break;
