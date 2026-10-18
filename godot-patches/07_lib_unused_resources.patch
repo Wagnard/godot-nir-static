@@ -1,0 +1,142 @@
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -34,6 +34,7 @@
+ #include "nir/nir_builder.h"
+ #include "nir_deref.h"
+ #include "util/ralloc.h"
++#include "util/set.h"
+ #include "util/u_debug.h"
+ #include "util/u_dynarray.h"
+ #include "util/u_math.h"
+@@ -679,6 +680,9 @@
+ 
+    struct dxil_module mod;
+ 
++   /* Library only: the resource variables the shader references; the others get no global symbol. */
++   struct set *used_resource_vars;
++
+    struct util_dynarray srv_metadata_nodes;
+    const struct dxil_value *srv_handles[MAX_SRVS];
+ 
+@@ -7290,11 +7294,57 @@
+    exec_list_append(&s->variables, &new_list);
+ }
+ 
++/* A DXIL library declares each resource with a global symbol, and the DXIL validator rejects a global
++ * nothing loads ("Internal declaration '...' is unused"). Resource variables are referenced by derefs
++ * (textures, samplers, images) or by vulkan_resource_index (buffers, acceleration structures).
++ */
++static void
++gather_used_resource_vars(struct ntd_context *ctx)
++{
++   ctx->used_resource_vars = _mesa_pointer_set_create(ctx->ralloc_ctx);
++   const nir_variable_mode resource_modes = nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo;
++   nir_foreach_function_impl(impl, ctx->shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_deref) {
++               nir_deref_instr *deref = nir_instr_as_deref(instr);
++               if (deref->deref_type == nir_deref_type_var && nir_deref_mode_is_one_of(deref, resource_modes))
++                  _mesa_set_add(ctx->used_resource_vars, deref->var);
++            } else if (instr->type == nir_instr_type_intrinsic) {
++               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++               if (intr->intrinsic != nir_intrinsic_vulkan_resource_index)
++                  continue;
++               nir_foreach_variable_with_modes(var, ctx->shader, resource_modes) {
++                  if (var->data.descriptor_set == nir_intrinsic_desc_set(intr) &&
++                      var->data.binding == nir_intrinsic_binding(intr))
++                     _mesa_set_add(ctx->used_resource_vars, var);
++               }
++            }
++         }
++      }
++   }
++}
++
++/* True when a library leaves out an unreferenced resource variable. It is still reported, so the caller's
++ * root signature is the same as for the other stages.
++ */
++static bool
++skip_unused_resource_var(struct ntd_context *ctx, nir_variable *var, enum dxil_resource_type type)
++{
++   if (!ctx->used_resource_vars || _mesa_set_search(ctx->used_resource_vars, var))
++      return false;
++   ctx->opts->godot_nir_callbacks->report_resource(var->data.binding, var->data.descriptor_set, (uint32_t)type,
++                                                   ctx->opts->godot_nir_callbacks->data);
++   return true;
++}
++
+ static bool
+ emit_cbvs(struct ntd_context *ctx)
+ {
+    if (ctx->opts->environment != DXIL_ENVIRONMENT_GL) {
+       nir_foreach_variable_with_modes(var, ctx->shader, nir_var_mem_ubo) {
++         if (skip_unused_resource_var(ctx, var, DXIL_RES_CBV))
++            continue;
+          if (!emit_ubo_var(ctx, var))
+             return false;
+       }
+@@ -7595,6 +7645,9 @@
+     * stale struct uniforms, they are lowered but might not have been removed */
+    sort_uniforms_by_binding_and_remove_structs(ctx->shader);
+ 
++   if (ctx->mod.emit_library)
++      gather_used_resource_vars(ctx);
++
+    /* CBVs */
+    if (!emit_cbvs(ctx))
+       return false;
+@@ -7603,6 +7656,8 @@
+    nir_foreach_variable_with_modes(var, ctx->shader, nir_var_uniform) {
+       unsigned count = glsl_type_get_sampler_count(var->type);
+       assert(count == 0 || glsl_type_is_bare_sampler(glsl_without_array(var->type)));
++      if (count > 0 && skip_unused_resource_var(ctx, var, DXIL_RES_SAMPLER))
++         continue;
+       if (count > 0 && !emit_sampler(ctx, var, count))
+          return false;
+    }
+@@ -7611,6 +7666,8 @@
+    nir_foreach_variable_with_modes(var, ctx->shader, nir_var_uniform) {
+       unsigned count = glsl_type_get_texture_count(var->type);
+       assert(count == 0 || glsl_type_is_texture(glsl_without_array(var->type)));
++      if (count > 0 && skip_unused_resource_var(ctx, var, DXIL_RES_SRV_TYPED))
++         continue;
+       if (count > 0 && !emit_srv(ctx, var, count, var->name))
+          return false;
+    }
+@@ -7618,6 +7675,8 @@
+    /* Acceleration structures */
+    nir_foreach_variable_with_modes(var, ctx->shader, nir_var_uniform) {
+       if (glsl_without_array(var->type) == glsl_uint64_t_type()) {
++         if (skip_unused_resource_var(ctx, var, DXIL_RES_SRV_RAW))
++            continue;
+          if (!emit_accel_struct(ctx, var, glsl_type_is_array(var->type) ? glsl_get_length(var->type) : 1))
+             return false;
+       }
+@@ -7638,6 +7697,8 @@
+                name = temp_name;
+             }
+ 
++            if (skip_unused_resource_var(ctx, var, DXIL_RES_SRV_RAW))
++               continue;
+             if (!emit_srv(ctx, var, count, name))
+                return false;
+          }
+@@ -7669,6 +7730,8 @@
+                name = temp_name;
+             }
+ 
++            if (skip_unused_resource_var(ctx, var, DXIL_RES_UAV_RAW))
++               continue;
+             if (!emit_uav(ctx, var->data.binding, var->data.descriptor_set,
+                         count, DXIL_COMP_TYPE_INVALID, 1,
+                         DXIL_RESOURCE_KIND_RAW_BUFFER, var->data.access, name))
+@@ -7696,6 +7759,8 @@
+    }
+ 
+    nir_foreach_image_variable(var, ctx->shader) {
++      if (skip_unused_resource_var(ctx, var, dxil_get_resource_kind(var->type) == DXIL_RESOURCE_KIND_RAW_BUFFER ? DXIL_RES_UAV_RAW : DXIL_RES_UAV_TYPED))
++         continue;
+       if (!emit_uav_var(ctx, var, glsl_type_get_image_count(var->type)))
+          return false;
+    }
