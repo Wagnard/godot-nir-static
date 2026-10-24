@@ -2,7 +2,7 @@
 +++ b/godot-mesa/src/microsoft/compiler/dxil_function.c
 @@ -34,7 +34,7 @@
  };
-
+ 
  static struct  predefined_func_descr predefined_funcs[] = {
 -{"dx.op.atomicBinOp", "O", "i@iiiii", DXIL_ATTR_KIND_READ_NONE},
 +{"dx.op.atomicBinOp", "O", "i@iiiii", DXIL_ATTR_KIND_NONE},

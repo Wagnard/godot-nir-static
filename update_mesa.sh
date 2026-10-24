@@ -248,7 +248,11 @@ tweak_gitignore
 
 if [ -d ./godot-patches ]; then
     echo "Applying patches"
-    find ./godot-patches -name '*.patch' -exec git apply {} \;
+    # In order, and stop at the first one that does not apply: `find -exec` ignored git apply's failures, so a patch
+    # that did not apply (09 on the Windows runners: CRLF made its blank context line corrupt) shipped a release without it.
+    for patch in $(find ./godot-patches -name '*.patch' | sort); do
+        git apply "$patch" || { echo "Error! $patch does not apply."; exit 1; }
+    done
 fi
 
 custom_source_gen
