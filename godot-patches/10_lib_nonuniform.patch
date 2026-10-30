@@ -1,0 +1,286 @@
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -1267,7 +1267,8 @@
+                                uint32_t lower_bound,
+                                unsigned resource_range_id,
+                                const struct dxil_value *index,
+-                               const struct dxil_value *global_symbol)
++                               const struct dxil_value *global_symbol,
++                               bool non_uniform_resource_index)
+ {
+    const struct dxil_type *ptr_target_type = dxil_type_get_pointer_target_type(dxil_value_get_type(global_symbol));
+ 
+@@ -1284,6 +1285,13 @@
+       if (!gep)
+          return NULL;
+ 
++      /* createHandleForLib has no non-uniform operand: a library carries NonUniformResourceIndex() as !dx.nonuniform
++       * on the resource array's getelementptr, as DXC marks it. Without it the driver may read the descriptor once
++       * per wave (AMD: a bindless texture of another material's hit in the same wave).
++       */
++      if (non_uniform_resource_index && !dxil_instr_mark_nonuniform(&ctx->mod, gep))
++         return NULL;
++
+       load = dxil_emit_load(&ctx->mod, gep, 4, false);
+    } else {
+       load = dxil_emit_load(&ctx->mod, global_symbol, 4, false);
+@@ -1496,7 +1504,8 @@
+             return emit_createhandle_for_lib_call(ctx, resource_class, resource->lower_bound,
+                                                   i - offset,
+                                                   index,
+-                                                  global_symbol);
++                                                  global_symbol,
++                                                  non_uniform_resource_index);
+          } else {
+             return emit_createhandle_call(ctx, resource_class, resource->lower_bound,
+                                           resource->upper_bound, space,
+@@ -6346,6 +6355,35 @@
+    return true;
+ }
+ 
++/* Whether a texture, sampler or image deref is accessed with a non-uniform index. emit_deref() creates its handle once
++ * for every access, so one access marked non-uniform (texture_non_uniform / sampler_non_uniform from a NonUniform
++ * SPIR-V operand, ACCESS_NON_UNIFORM on an image intrinsic) makes the handle's index non-uniform
++ * (NonUniformResourceIndex). Without it every bindless descriptor array was read as dynamically uniform.
++ */
++static bool
++deref_has_non_uniform_use(nir_deref_instr *deref)
++{
++   nir_foreach_use(src, &deref->def) {
++      nir_instr *user = nir_src_parent_instr(src);
++      if (user->type == nir_instr_type_tex) {
++         nir_tex_instr *tex = nir_instr_as_tex(user);
++         for (unsigned i = 0; i < tex->num_srcs; i++) {
++            if (&tex->src[i].src != src)
++               continue;
++            if (tex->src[i].src_type == nir_tex_src_texture_deref && tex->texture_non_uniform)
++               return true;
++            if (tex->src[i].src_type == nir_tex_src_sampler_deref && tex->sampler_non_uniform)
++               return true;
++         }
++      } else if (user->type == nir_instr_type_intrinsic) {
++         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(user);
++         if (nir_intrinsic_has_access(intr) && (nir_intrinsic_access(intr) & ACCESS_NON_UNIFORM))
++            return true;
++      }
++   }
++   return false;
++}
++
+ static bool
+ emit_deref(struct ntd_context* ctx, nir_deref_instr* instr)
+ {
+@@ -6468,7 +6506,7 @@
+    unsigned descriptor_set = ctx->opts->environment == DXIL_ENVIRONMENT_VULKAN ?
+       var->data.descriptor_set : (glsl_type_is_image(type) ? 1 : 0);
+    const struct dxil_value *handle = emit_createhandle_call_dynamic(ctx, res_class,
+-      descriptor_set, binding_val, binding, false);
++      descriptor_set, binding_val, binding, deref_has_non_uniform_use(instr));
+    if (!handle)
+       return false;
+ 
+--- a/godot-mesa/src/microsoft/compiler/dxil_module.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_module.c
+@@ -1286,6 +1286,7 @@
+    DXIL_FUNCTION_BLOCK = DXIL_FIRST_APPLICATION_BLOCK + 4,
+    DXIL_VALUE_SYMTAB_BLOCK = DXIL_FIRST_APPLICATION_BLOCK + 6,
+    DXIL_METADATA_BLOCK = DXIL_FIRST_APPLICATION_BLOCK + 7,
++   DXIL_METADATA_ATTACHMENT_BLOCK = DXIL_FIRST_APPLICATION_BLOCK + 8,
+    DXIL_TYPE_BLOCK = DXIL_FIRST_APPLICATION_BLOCK + 9,
+ };
+ 
+@@ -2918,9 +2919,20 @@
+   METADATA_NODE = 3,
+   METADATA_NAME = 4,
+   METADATA_KIND = 6,
+-  METADATA_NAMED_NODE = 10
++  METADATA_NAMED_NODE = 10,
++  METADATA_ATTACHMENT = 11
+ };
+ 
++/* The metadata kinds LLVM 3.7 numbers itself (LLVMContext's fixed kinds), whose names its bitcode writer emits
++ * before any other, then the ones we attach to instructions.
++ */
++static const char *const metadata_kind_names[] = {
++   "dbg", "tbaa", "prof", "fpmath", "range", "tbaa.struct", "invariant.load", "alias.scope", "noalias",
++   "nontemporal", "llvm.mem.parallel_loop_access", "nonnull", "dereferenceable", "dereferenceable_or_null",
++   "dx.nonuniform",
++};
++#define DXIL_MD_KIND_NONUNIFORM 14
++
+ enum metadata_abbrev_id {
+    METADATA_ABBREV_STRING,
+    METADATA_ABBREV_NAME
+@@ -3254,6 +3266,51 @@
+           exit_block(m);
+ }
+ 
++/* METADATA_KIND - [n x [id, name]], in a metadata block of its own after the module's metadata, as LLVM 3.7 writes it
++ * (WriteModuleMetadataStore()). Only when an instruction carries metadata.
++ */
++static bool
++emit_metadata_kinds(struct dxil_module *m)
++{
++   if (!m->nonuniform_md)
++      return true;
++
++   if (!enter_subblock(m, DXIL_METADATA_BLOCK, 3))
++      return false;
++
++   STATIC_ASSERT(ARRAY_SIZE(metadata_kind_names) == DXIL_MD_KIND_NONUNIFORM + 1);
++   for (unsigned kind = 0; kind < ARRAY_SIZE(metadata_kind_names); ++kind) {
++      const char *name = metadata_kind_names[kind];
++      uint64_t data[64];
++      size_t length = strlen(name);
++      assert(length < ARRAY_SIZE(data));
++      data[0] = kind;
++      for (size_t i = 0; i < length; ++i)
++         data[i + 1] = name[i];
++      if (!emit_record(m, METADATA_KIND, data, length + 1))
++         return false;
++   }
++
++   return exit_block(m);
++}
++
++bool
++dxil_instr_mark_nonuniform(struct dxil_module *m, const struct dxil_value *value)
++{
++   if (!m->nonuniform_md) {
++      const struct dxil_mdnode *one = dxil_get_metadata_int32(m, 1);
++      if (!one)
++         return false;
++      m->nonuniform_md = dxil_get_metadata_node(m, &one, 1);
++      if (!m->nonuniform_md)
++         return false;
++   }
++
++   struct dxil_instr *instr = container_of(value, struct dxil_instr, value);
++   instr->nonuniform = true;
++   return true;
++}
++
+ static struct dxil_instr *
+ create_instr(struct dxil_module *m, enum instr_type type,
+              const struct dxil_type *ret_type)
+@@ -3265,6 +3322,7 @@
+       ret->value.id = -1;
+       ret->value.type = ret_type;
+       ret->has_value = false;
++      ret->nonuniform = false;
+       list_addtail(&ret->head, &m->cur_emitting_func->instr_list);
+    }
+    return ret;
+@@ -4099,6 +4157,40 @@
+    }
+ }
+ 
++/* METADATA_ATTACHMENT - [instruction, n x [kind, node]], in a block after the function's instructions and value symbol
++ * table, as LLVM 3.7 writes it (WriteMetadataAttachment()). The instruction is its index in the function, counting
++ * every instruction (each is one record); the node, its metadata id.
++ */
++static bool
++emit_metadata_attachments(struct dxil_module *m, struct dxil_func_def *func)
++{
++   bool any = false;
++   list_for_each_entry(struct dxil_instr, instr, &func->instr_list, head) {
++      if (instr->nonuniform) {
++         any = true;
++         break;
++      }
++   }
++   if (!any)
++      return true;
++
++   if (!enter_subblock(m, DXIL_METADATA_ATTACHMENT_BLOCK, 3))
++      return false;
++
++   uint64_t index = 0;
++   list_for_each_entry(struct dxil_instr, instr, &func->instr_list, head) {
++      if (instr->nonuniform) {
++         assert(m->nonuniform_md && m->nonuniform_md->id > 0);
++         const uint64_t data[] = { index, DXIL_MD_KIND_NONUNIFORM, m->nonuniform_md->id - 1 };
++         if (!emit_record(m, METADATA_ATTACHMENT, data, ARRAY_SIZE(data)))
++            return false;
++      }
++      index++;
++   }
++
++   return exit_block(m);
++}
++
+ static bool
+ emit_function(struct dxil_module *m, struct dxil_func_def *func)
+ {
+@@ -4128,6 +4220,9 @@
+          return false;
+    }
+ 
++   if (!emit_metadata_attachments(m, func))
++      return false;
++
+    return exit_block(m);
+ }
+ 
+@@ -4187,6 +4282,7 @@
+          emit_module_info(m) &&
+          emit_module_consts(m) &&
+          emit_metadata(m) &&
++         emit_metadata_kinds(m) &&
+          emit_value_symbol_table(m)))
+       return false;
+ 
+--- a/godot-mesa/src/microsoft/compiler/dxil_module.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_module.h
+@@ -288,6 +288,8 @@
+    struct list_head attr_set_list;
+    struct list_head const_list;
+    struct list_head mdnode_list;
++   /* !{i32 1}, created by the first dxil_instr_mark_nonuniform(). */
++   const struct dxil_mdnode *nonuniform_md;
+    struct list_head md_named_node_list;
+    const struct dxil_type *void_type;
+    const struct dxil_type *int1_type, *int8_type, *int16_type,
+@@ -545,6 +547,14 @@
+                              const struct dxil_mdnode *subnodes[],
+                              size_t num_subnodes);
+ 
++/* Attaches !dx.nonuniform !{i32 1} to the instruction that produced value: DXC
++ * marks the getelementptr into a resource array with it when the index is
++ * NonUniformResourceIndex() in a library, where createHandleForLib has no
++ * non-uniform operand (DxilMDHelper::MarkNonUniform()).
++ */
++bool
++dxil_instr_mark_nonuniform(struct dxil_module *m, const struct dxil_value *value);
++
+ const struct dxil_value *
+ dxil_emit_binop(struct dxil_module *m, enum dxil_bin_opcode opcode,
+                 const struct dxil_value *op0, const struct dxil_value *op1,
+--- a/godot-mesa/src/microsoft/compiler/dxil_internal.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_internal.h
+@@ -278,6 +278,9 @@
+    bool has_value;
+    struct dxil_value value;
+ 
++   /* Carries !dx.nonuniform (dxil_instr_mark_nonuniform()). */
++   bool nonuniform;
++
+    struct list_head head;
+ };
+ 
+--- a/godot-mesa/src/compiler/spirv/spirv_to_nir.c
++++ b/godot-mesa/src/compiler/spirv/spirv_to_nir.c
+@@ -3090,6 +3090,13 @@
+       if (vtn_has_decoration(b, vtn_untyped_value(b, w[3]), SpvDecorationNonUniformEXT))
+          access |= ACCESS_NON_UNIFORM;
+ 
++      /* The image of a sampled image built from a NonUniform descriptor load is as non-uniform as the sampled image,
++       * which OpSampledImage already propagates: glslang decorates only the load for
++       * texelFetch(sampler2D(textures[nonuniformEXT(i)], s), ...), whose OpImageFetch reads this image.
++       */
++      if (vtn_untyped_value(b, w[3])->propagated_non_uniform)
++         access |= ACCESS_NON_UNIFORM;
++
+       vtn_push_image(b, w[2], si.image, access & ACCESS_NON_UNIFORM);
+       return;
+    } else if (opcode == SpvOpImageSparseTexelsResident) {
