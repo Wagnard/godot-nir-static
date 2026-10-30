@@ -34,7 +34,7 @@
           } else {
              return emit_createhandle_call(ctx, resource_class, resource->lower_bound,
                                            resource->upper_bound, space,
-@@ -6346,6 +6355,35 @@
+@@ -6346,6 +6355,44 @@
     return true;
  }
  
@@ -64,13 +64,22 @@
 +            return true;
 +      }
 +   }
++
++   /* A non-uniform index the SPIR-V does not mark: glslang decorates only the index of tex[nonuniformEXT(i)], so a
++    * texture passed to a function (vec4 f(sampler2D t)) loses it at the call and the access inside the function is
++    * unmarked. The divergence analysis run before emission (nir_to_dxil()) still sees the index vary per invocation.
++    */
++   for (nir_deref_instr *d = deref; d && d->deref_type != nir_deref_type_var; d = nir_deref_instr_parent(d)) {
++      if (d->deref_type == nir_deref_type_array && nir_src_is_divergent(&d->arr.index))
++         return true;
++   }
 +   return false;
 +}
 +
  static bool
  emit_deref(struct ntd_context* ctx, nir_deref_instr* instr)
  {
-@@ -6468,7 +6506,7 @@
+@@ -6468,7 +6515,7 @@
     unsigned descriptor_set = ctx->opts->environment == DXIL_ENVIRONMENT_VULKAN ?
        var->data.descriptor_set : (glsl_type_is_image(type) ? 1 : 0);
     const struct dxil_value *handle = emit_createhandle_call_dynamic(ctx, res_class,
@@ -79,6 +88,16 @@
     if (!handle)
        return false;
  
+@@ -8446,6 +8493,9 @@
+    if (debug_dxil & DXIL_DEBUG_VERBOSE)
+       nir_print_shader(s, stderr);
+ 
++   /* For deref_has_non_uniform_use(): resource indices that vary per invocation without being marked. */
++   nir_divergence_analysis(s);
++
+    if (!emit_module(ctx, opts)) {
+       debug_printf("D3D12: dxil_container_add_module failed\n");
+       retval = false;
 --- a/godot-mesa/src/microsoft/compiler/dxil_module.c
 +++ b/godot-mesa/src/microsoft/compiler/dxil_module.c
 @@ -1286,6 +1286,7 @@
