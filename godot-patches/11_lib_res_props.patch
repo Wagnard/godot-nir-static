@@ -1,0 +1,204 @@
+--- a/godot-mesa/src/microsoft/compiler/dxil_container.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_container.c
+@@ -199,7 +199,17 @@
+    func_info.base.payload_size_in_bytes = runtime_data->payload_size_in_bytes;
+    func_info.base.attribute_size_in_bytes = runtime_data->attribute_size_in_bytes;
+ 
+-   uint64_t feature_info = *(uint64_t*)&m->feats;
++   /* A function's features, as DXC records them in the function table: the ones it derives from the module's resource
++    * list (DxilModule::CollectShaderFlagsForModule(): ROVs, 64 UAVs, UAVs at every stage, raw buffers in a 4.x compute
++    * shader) are not the function's (ShaderFlags::CollectShaderFlags()), and the validator compares this table with
++    * the one it builds.
++    */
++   struct dxil_features function_feats = m->feats;
++   function_feats.rovs = 0;
++   function_feats.use_64uavs = 0;
++   function_feats.uavs_at_every_stage = 0;
++   function_feats.cs_4x_raw_sb = 0;
++   uint64_t feature_info = *(uint64_t*)&function_feats;
+    func_info.base.feature_info_1 = feature_info & 0xFFFFFFFF;
+    func_info.base.feature_info_2 = feature_info >> 32;
+ 
+--- a/godot-mesa/src/microsoft/compiler/dxil_module.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_module.c
+@@ -2072,7 +2072,8 @@
+ static void
+ fill_res_props_dwords(uint32_t dwords[2],
+                       enum dxil_resource_class class,
+-                      const struct dxil_mdnode *mdnode)
++                      const struct dxil_mdnode *mdnode,
++                      const struct dxil_type *res_type)
+ {
+    enum dxil_resource_kind kind = DXIL_RESOURCE_KIND_INVALID;
+    uint32_t sample_count = 0;
+@@ -2108,6 +2109,8 @@
+       UNREACHABLE("Unimplemented");
+    case DXIL_RESOURCE_KIND_RAW_BUFFER:
+    case DXIL_RESOURCE_KIND_SAMPLER:
++   case DXIL_RESOURCE_KIND_RAYTRACING_ACCELERATION_STRUCTURE:
++      /* DXC leaves the second dword of an acceleration structure's properties zero (loadPropsFromResourceBase()). */
+       dwords[1] = 0;
+       break;
+    case DXIL_RESOURCE_KIND_CBUFFER:
+@@ -2115,14 +2118,21 @@
+       break;
+    default: {
+       unsigned tag_array_index = class == DXIL_RESOURCE_CLASS_SRV ? 8 : 10;
+-      const struct dxil_type *res_ptr_type = mdnode->node.subnodes[1]->value.type;
+-      const struct dxil_type *res_type = res_ptr_type->ptr_target_type->type == TYPE_ARRAY ?
+-         res_ptr_type->ptr_target_type->array_or_vector_def.elem_type : res_ptr_type->ptr_target_type;
++      /* In a library the metadata references a %dx.types.Handle global (shader model 6.6), which does not say the
++       * resource's type: the caller passes it then.
++       */
++      if (!res_type) {
++         const struct dxil_type *res_ptr_type = mdnode->node.subnodes[1]->value.type;
++         res_type = res_ptr_type->ptr_target_type->type == TYPE_ARRAY ?
++            res_ptr_type->ptr_target_type->array_or_vector_def.elem_type : res_ptr_type->ptr_target_type;
++      }
+       const struct dxil_type *vec_type = res_type->struct_def.elem.types[0];
++      /* As DXC counts them (dxilutil::GetResourceComponentCount()): a scalar element is one component. */
++      const unsigned num_comps = vec_type->type == TYPE_VECTOR ? vec_type->array_or_vector_def.num_elems : 1;
+       dwords[1] = get_typed_srv_uav_res_props_dword(
+          (enum dxil_component_type)get_int_from_mdnode(
+             mdnode->node.subnodes[tag_array_index], 1),
+-         vec_type->array_or_vector_def.num_elems,
++         num_comps,
+          sample_count);
+       break;
+       }
+@@ -2132,14 +2142,15 @@
+ const struct dxil_value *
+ dxil_module_get_res_props_const(struct dxil_module *m,
+                                 enum dxil_resource_class class,
+-                                const struct dxil_mdnode *mdnode)
++                                const struct dxil_mdnode *mdnode,
++                                const struct dxil_type *res_type)
+ {
+    const struct dxil_type *type = dxil_module_get_res_props_type(m);
+    if (!type)
+       return NULL;
+ 
+    uint32_t dwords[2];
+-   fill_res_props_dwords(dwords, class, mdnode);
++   fill_res_props_dwords(dwords, class, mdnode, res_type);
+ 
+    const struct dxil_value *values[2] = {
+       dxil_module_get_int32_const(m, dwords[0]),
+--- a/godot-mesa/src/microsoft/compiler/dxil_module.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_module.h
+@@ -490,10 +490,14 @@
+                                uint32_t space,
+                                uint8_t class);
+ 
++/* res_type: the resource's own type (its class struct, not an array of it), or NULL to read it from mdnode, which a
++ * library's %dx.types.Handle global cannot give.
++ */
+ const struct dxil_value *
+ dxil_module_get_res_props_const(struct dxil_module *m,
+                                 enum dxil_resource_class class,
+-                                const struct dxil_mdnode *mdnode);
++                                const struct dxil_mdnode *mdnode,
++                                const struct dxil_type *res_type);
+ 
+ const struct dxil_value *
+ dxil_module_get_srv_res_props_const(struct dxil_module *m,
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -684,9 +684,14 @@
+    struct set *used_resource_vars;
+ 
+    struct util_dynarray srv_metadata_nodes;
++   /* Each SRV's and UAV's own type (not an array of it), in the order of their metadata nodes: their handles'
++    * properties come from it, which a library's %dx.types.Handle globals do not carry.
++    */
++   struct util_dynarray srv_res_types;
+    const struct dxil_value *srv_handles[MAX_SRVS];
+ 
+    struct util_dynarray uav_metadata_nodes;
++   struct util_dynarray uav_res_types;
+    const struct dxil_value *ssbo_handles[MAX_UAVS];
+    const struct dxil_value *image_handles[MAX_UAVS];
+    uint32_t num_uavs;
+@@ -1184,12 +1189,15 @@
+ {
+ 
+    const struct util_dynarray *mdnodes;
++   const struct dxil_type *res_type = NULL;
+    switch (resource_class) {
+    case DXIL_RESOURCE_CLASS_SRV:
+       mdnodes = &ctx->srv_metadata_nodes;
++      res_type = *util_dynarray_element(&ctx->srv_res_types, const struct dxil_type *, resource_range_id);
+       break;
+    case DXIL_RESOURCE_CLASS_UAV:
+       mdnodes = &ctx->uav_metadata_nodes;
++      res_type = *util_dynarray_element(&ctx->uav_res_types, const struct dxil_type *, resource_range_id);
+       break;
+    case DXIL_RESOURCE_CLASS_CBV:
+       mdnodes = &ctx->cbv_metadata_nodes;
+@@ -1202,7 +1210,7 @@
+    }
+ 
+    const struct dxil_mdnode *mdnode = *util_dynarray_element(mdnodes, const struct dxil_mdnode *, resource_range_id);
+-   const struct dxil_value *res_props = dxil_module_get_res_props_const(&ctx->mod, resource_class, mdnode);
++   const struct dxil_value *res_props = dxil_module_get_res_props_const(&ctx->mod, resource_class, mdnode, res_type);
+    if (!res_props)
+       return NULL;
+ 
+@@ -1539,6 +1547,7 @@
+       res_type = DXIL_RES_SRV_TYPED;
+    }
+    const struct dxil_type *res_type_as_type = dxil_module_get_res_type(&ctx->mod, res_kind, comp_type, 4, false /* readwrite */);
++   const struct dxil_type *own_res_type = res_type_as_type;
+ 
+    if (glsl_type_is_array(var->type))
+       res_type_as_type = dxil_module_get_array_type(&ctx->mod, res_type_as_type, count);
+@@ -1557,6 +1566,7 @@
+       return false;
+ 
+    util_dynarray_append(&ctx->srv_metadata_nodes, const struct dxil_mdnode *, srv_meta);
++   util_dynarray_append(&ctx->srv_res_types, const struct dxil_type *, own_res_type);
+    add_resource(ctx, DXIL_RESOURCE_CLASS_SRV, res_type, res_kind, &layout, name, global_symbol);
+    if (res_type == DXIL_RES_SRV_RAW)
+       ctx->mod.raw_and_structured_buffers = true;
+@@ -1573,6 +1583,7 @@
+ 
+    const struct dxil_type *res_type_as_type = dxil_module_get_res_type(&ctx->mod, DXIL_RESOURCE_KIND_RAYTRACING_ACCELERATION_STRUCTURE,
+                                                                        DXIL_COMP_TYPE_I32, 0, false);
++   const struct dxil_type *own_res_type = res_type_as_type;
+ 
+    if (glsl_type_is_array(var->type))
+       res_type_as_type = dxil_module_get_array_type(&ctx->mod, res_type_as_type, count);
+@@ -1591,6 +1602,7 @@
+       return false;
+ 
+    util_dynarray_append(&ctx->srv_metadata_nodes, const struct dxil_mdnode *, srv_meta);
++   util_dynarray_append(&ctx->srv_res_types, const struct dxil_type *, own_res_type);
+    add_resource(ctx, DXIL_RESOURCE_CLASS_SRV, DXIL_RES_SRV_RAW, DXIL_RESOURCE_KIND_RAYTRACING_ACCELERATION_STRUCTURE, &layout, var->name, global_symbol);
+ 
+    return true;
+@@ -1605,6 +1617,7 @@
+    resource_array_layout layout = { id, binding, count, space };
+ 
+    const struct dxil_type *res_type = dxil_module_get_res_type(&ctx->mod, res_kind, comp_type, num_comps, true /* readwrite */);
++   const struct dxil_type *own_res_type = res_type;
+    res_type = dxil_module_get_array_type(&ctx->mod, res_type, count);
+ 
+    const struct dxil_value *global_symbol = NULL;
+@@ -1621,6 +1634,7 @@
+       return false;
+ 
+    util_dynarray_append(&ctx->uav_metadata_nodes, const struct dxil_mdnode *, uav_meta);
++   util_dynarray_append(&ctx->uav_res_types, const struct dxil_type *, own_res_type);
+    if (ctx->mod.minor_validator < 6 &&
+        util_dynarray_num_elements(&ctx->uav_metadata_nodes, const struct dxil_mdnode *) > 8)
+       ctx->mod.feats.use_64uavs = 1;
+@@ -8386,7 +8400,9 @@
+    }
+ 
+    util_dynarray_init(&ctx->srv_metadata_nodes, ctx->ralloc_ctx);
++   util_dynarray_init(&ctx->srv_res_types, ctx->ralloc_ctx);
+    util_dynarray_init(&ctx->uav_metadata_nodes, ctx->ralloc_ctx);
++   util_dynarray_init(&ctx->uav_res_types, ctx->ralloc_ctx);
+    util_dynarray_init(&ctx->cbv_metadata_nodes, ctx->ralloc_ctx);
+    util_dynarray_init(&ctx->sampler_metadata_nodes, ctx->ralloc_ctx);
+    util_dynarray_init(&ctx->resources, ctx->ralloc_ctx);
