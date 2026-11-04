@@ -1,0 +1,42 @@
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_container.c b/godot-mesa/src/microsoft/compiler/dxil_container.c
+index 03e68d1..f31a518 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_container.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_container.c
+@@ -213,8 +213,11 @@ dxil_container_add_runtime_data(struct dxil_container *c,
+    func_info.base.feature_info_1 = feature_info & 0xFFFFFFFF;
+    func_info.base.feature_info_2 = feature_info >> 32;
+ 
++   /* The lowest shader model of every operation the function uses (DXC: OP::GetMinShaderModelAndMask()); the
++    * validator compares it with the one it computes.
++    */
+    uint32_t minor_version = 3;
+-   if (m->uses_hit_objects)
++   if (m->uses_hit_objects || m->uses_allocate_ray_query_2)
+       minor_version = 9;
+    else if (m->feats.sample_cmp_bias_gradient || m->feats.extended_command_info)
+       minor_version = 8;
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_module.h b/godot-mesa/src/microsoft/compiler/dxil_module.h
+index 6d3feef..7e9110c 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_module.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_module.h
+@@ -215,6 +215,8 @@ struct dxil_module {
+    bool emit_library;
+    /* Hit objects (shader execution reordering) require shader model 6.9. */
+    bool uses_hit_objects;
++   /* So do ray queries allocated with AllocateRayQuery2 (opacity micromaps). */
++   bool uses_allocate_ray_query_2;
+    unsigned major_version, minor_version;
+    unsigned major_validator, minor_validator;
+    struct dxil_features feats;
+diff --git a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+index d9450d5..5db5caa 100644
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -6435,6 +6435,7 @@ emit_deref(struct ntd_context* ctx, nir_deref_instr* instr)
+                const struct dxil_func *func = dxil_get_function(&ctx->mod, "dx.op.allocateRayQuery2", DXIL_NONE);
+                if (!func)
+                   return false;
++               ctx->mod.uses_allocate_ray_query_2 = true;
+ 
+                const struct dxil_value *args[] = {
+                   dxil_module_get_int32_const(&ctx->mod, DXIL_INTR_ALLOCATE_RAY_QUERY_2),
