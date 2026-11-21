@@ -1,0 +1,115 @@
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_container.c b/godot-mesa/src/microsoft/compiler/dxil_container.c
+index f31a518..c1b2acb 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_container.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_container.c
+@@ -325,7 +325,11 @@ dxil_container_add_runtime_data(struct dxil_container *c,
+          res_info.lower_bound = resource->lower_bound;
+          res_info.upper_bound = resource->upper_bound;
+          res_info.name = resource_name_offset;
+-         res_info.flags = 0;
++         /* The validator builds this table from the module's resource metadata and compares (DXC:
++          * DxilContainerAssembler.cpp, InsertToResourceTable()): a UAV declared globally coherent in its metadata must
++          * carry UAVGloballyCoherent here too.
++          */
++         res_info.flags = resource->flags;
+ 
+          if (!blob_write_bytes(&c->parts, &res_info, sizeof(res_info)))
+             return false;
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_container.h b/godot-mesa/src/microsoft/compiler/dxil_container.h
+index 81df0db..9310260 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_container.h
++++ b/godot-mesa/src/microsoft/compiler/dxil_container.h
+@@ -96,6 +96,16 @@ struct dxil_validation_state {
+    uint32_t num_resources;
+ };
+ 
++/* RDAT resource flags (DXC: RDAT::DxilResourceFlag, include/dxc/DxilContainer/RDAT_LibraryTypes.inl). */
++enum dxil_runtime_data_resource_flag {
++   DXIL_RUNTIME_DATA_RESOURCE_FLAG_UAV_GLOBALLY_COHERENT = 1 << 0,
++   DXIL_RUNTIME_DATA_RESOURCE_FLAG_UAV_COUNTER = 1 << 1,
++   DXIL_RUNTIME_DATA_RESOURCE_FLAG_UAV_RASTERIZER_ORDERED_VIEW = 1 << 2,
++   DXIL_RUNTIME_DATA_RESOURCE_FLAG_DYNAMIC_INDEXING = 1 << 3,
++   DXIL_RUNTIME_DATA_RESOURCE_FLAG_ATOMICS_64_USE = 1 << 4,
++   DXIL_RUNTIME_DATA_RESOURCE_FLAG_UAV_REORDER_COHERENT = 1 << 5,
++};
++
+ struct dxil_runtime_data_resource {
+    uint32_t class;
+    uint32_t kind;
+@@ -104,6 +114,7 @@ struct dxil_runtime_data_resource {
+    uint32_t lower_bound;
+    uint32_t upper_bound;
+    const char *name;
++   uint32_t flags; /* enum dxil_runtime_data_resource_flag */
+ };
+ 
+ struct dxil_runtime_data {
+diff --git a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+index 5db5caa..a8ef0be 100644
+--- a/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
++++ b/godot-mesa/src/microsoft/compiler/nir_to_dxil.c
+@@ -1411,7 +1411,8 @@ add_resource(struct ntd_context *ctx,
+              enum dxil_resource_kind kind,
+              const resource_array_layout *layout,
+              const char *name,
+-             const struct dxil_value *global_symbol)
++             const struct dxil_value *global_symbol,
++             uint32_t rdat_flags)
+ {
+    struct dxil_resource_v0 *resource_v0 = NULL;
+    struct dxil_resource_v1 *resource_v1 = NULL;
+@@ -1457,6 +1458,7 @@ add_resource(struct ntd_context *ctx,
+       resource->lower_bound = layout->binding;
+       resource->upper_bound = resource_v0->upper_bound;
+       resource->name = ralloc_strdup(ctx->ralloc_ctx, name);
++      resource->flags = rdat_flags;
+ 
+       assert(global_symbol);
+       const struct dxil_value **global_symbol_element = util_dynarray_grow(&ctx->global_resource_symbols, struct dxil_value *, 1);
+@@ -1567,7 +1569,7 @@ emit_srv(struct ntd_context *ctx, nir_variable *var, unsigned count, const char
+ 
+    util_dynarray_append(&ctx->srv_metadata_nodes, const struct dxil_mdnode *, srv_meta);
+    util_dynarray_append(&ctx->srv_res_types, const struct dxil_type *, own_res_type);
+-   add_resource(ctx, DXIL_RESOURCE_CLASS_SRV, res_type, res_kind, &layout, name, global_symbol);
++   add_resource(ctx, DXIL_RESOURCE_CLASS_SRV, res_type, res_kind, &layout, name, global_symbol, 0);
+    if (res_type == DXIL_RES_SRV_RAW)
+       ctx->mod.raw_and_structured_buffers = true;
+ 
+@@ -1603,7 +1605,7 @@ emit_accel_struct(struct ntd_context *ctx, nir_variable *var, unsigned count)
+ 
+    util_dynarray_append(&ctx->srv_metadata_nodes, const struct dxil_mdnode *, srv_meta);
+    util_dynarray_append(&ctx->srv_res_types, const struct dxil_type *, own_res_type);
+-   add_resource(ctx, DXIL_RESOURCE_CLASS_SRV, DXIL_RES_SRV_RAW, DXIL_RESOURCE_KIND_RAYTRACING_ACCELERATION_STRUCTURE, &layout, var->name, global_symbol);
++   add_resource(ctx, DXIL_RESOURCE_CLASS_SRV, DXIL_RES_SRV_RAW, DXIL_RESOURCE_KIND_RAYTRACING_ACCELERATION_STRUCTURE, &layout, var->name, global_symbol, 0);
+ 
+    return true;
+ }
+@@ -1639,7 +1641,9 @@ emit_uav(struct ntd_context *ctx, unsigned binding, unsigned space, unsigned cou
+        util_dynarray_num_elements(&ctx->uav_metadata_nodes, const struct dxil_mdnode *) > 8)
+       ctx->mod.feats.use_64uavs = 1;
+ 
+-   add_resource(ctx, DXIL_RESOURCE_CLASS_UAV, res_kind == DXIL_RESOURCE_KIND_RAW_BUFFER ? DXIL_RES_UAV_RAW : DXIL_RES_UAV_TYPED, res_kind, &layout, name, global_symbol);
++   /* The library's RDAT resource table repeats the flags of the metadata above (DXC: InsertToResourceTable()). */
++   add_resource(ctx, DXIL_RESOURCE_CLASS_UAV, res_kind == DXIL_RESOURCE_KIND_RAW_BUFFER ? DXIL_RES_UAV_RAW : DXIL_RES_UAV_TYPED, res_kind, &layout, name, global_symbol,
++                (access & ACCESS_COHERENT) ? DXIL_RUNTIME_DATA_RESOURCE_FLAG_UAV_GLOBALLY_COHERENT : 0);
+    if (res_kind == DXIL_RESOURCE_KIND_RAW_BUFFER)
+       ctx->mod.raw_and_structured_buffers = true;
+    if (!ctx->mod.emit_library &&
+@@ -1874,7 +1878,7 @@ emit_cbv(struct ntd_context *ctx, unsigned binding, unsigned space,
+       return false;
+ 
+    util_dynarray_append(&ctx->cbv_metadata_nodes, const struct dxil_mdnode *, cbv_meta);
+-   add_resource(ctx, DXIL_RESOURCE_CLASS_CBV, DXIL_RES_CBV, DXIL_RESOURCE_KIND_CBUFFER, &layout, name, global_symbol);
++   add_resource(ctx, DXIL_RESOURCE_CLASS_CBV, DXIL_RES_CBV, DXIL_RESOURCE_KIND_CBUFFER, &layout, name, global_symbol, 0);
+ 
+    return true;
+ }
+@@ -1927,7 +1931,7 @@ emit_sampler(struct ntd_context *ctx, nir_variable *var, unsigned count)
+       return false;
+ 
+    util_dynarray_append(&ctx->sampler_metadata_nodes, const struct dxil_mdnode *, sampler_meta);
+-   add_resource(ctx, DXIL_RESOURCE_CLASS_SAMPLER, DXIL_RES_SAMPLER, DXIL_RESOURCE_KIND_SAMPLER, &layout, var->name, global_symbol);
++   add_resource(ctx, DXIL_RESOURCE_CLASS_SAMPLER, DXIL_RES_SAMPLER, DXIL_RESOURCE_KIND_SAMPLER, &layout, var->name, global_symbol, 0);
+ 
+    return true;
+ }
