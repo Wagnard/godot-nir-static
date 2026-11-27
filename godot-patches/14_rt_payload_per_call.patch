@@ -1,0 +1,25 @@
+diff --git a/godot-mesa/src/microsoft/compiler/dxil_nir.c b/godot-mesa/src/microsoft/compiler/dxil_nir.c
+index e25c95f..34e9ba6 100644
+--- a/godot-mesa/src/microsoft/compiler/dxil_nir.c
++++ b/godot-mesa/src/microsoft/compiler/dxil_nir.c
+@@ -2920,9 +2920,17 @@ lower_rt_payload_to_temp(nir_builder *b,
+ 
+    nir_variable *var = deref->var;
+ 
+-   if (var->data.mode & nir_var_mem_generic)
+-      return false;
+-
++   /* Every call gets a payload of its own, copied in before the call and
++    * back after it, whatever the mode of the variable it names: HLSL passes
++    * the payload as an inout argument and DXC gives each TraceRay /
++    * CallShader / HitObject::TraceRay / HitObject::Invoke its own alloca.
++    * The ray payloads a raygen declares (shader_temp) used to keep their
++    * variable, so one alloca went to every call, a shape DXC never emits;
++    * NVIDIA's D3D12 driver then gave the raygen a wrong payload after a
++    * HitObject::Invoke that followed a MaybeReorderThread in a branch the
++    * threads did not take. The variable itself now has only loads and stores
++    * and becomes SSA values.
++    */
+    b->cursor = nir_before_instr(instr);
+ 
+    nir_variable *tmp = nir_local_variable_create(b->impl, var->type, NULL);
